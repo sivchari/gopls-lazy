@@ -29,17 +29,44 @@ No server, no shared cache, no infrastructure.
 
 ## Usage
 
-Point your editor's gopls path at the proxy:
-
 ```
-gopls-fleet [-gopls /path/to/gopls] [-granularity 3] [-debounce 500ms] [-driver=true] [-log /tmp/fleet.log]
+gopls-fleet [flags]
+
+  -gopls path        gopls binary (default: "gopls" from PATH)
+  -granularity n     path segments per scope unit (default 3:
+                     go/services/auth/internal/x.go -> go/services/auth)
+  -debounce dur      coalesce window for scope changes (default 500ms)
+  -evict dur         drop units with no open files after this idle time
+                     (default 10m; 0 disables)
+  -driver=bool       GOPACKAGESDRIVER graph cache (default true)
+  -log path          debug log
 ```
 
-- `-granularity`: number of path segments that form one scope unit.
-  `3` maps `go/services/auth/internal/tokens/x.go` to `go/services/auth`.
-- `-driver=false`: disable the GOPACKAGESDRIVER cache and always use go list.
-- Other gopls settings pass through untouched (the proxy patches
-  `initialize` options and `workspace/configuration` responses only).
+Unrecognized flags are forwarded to gopls, so the proxy is a drop-in
+replacement for the gopls binary. Every flag can also be set via environment
+variables (`GOPLS_FLEET_GOPLS`, `GOPLS_FLEET_GRANULARITY`,
+`GOPLS_FLEET_DEBOUNCE`, `GOPLS_FLEET_EVICT`, `GOPLS_FLEET_DRIVER=false`,
+`GOPLS_FLEET_LOG`) for editors that cannot pass arguments.
+
+### VS Code
+
+```jsonc
+// settings.json
+{
+  "go.alternateTools": { "gopls": "/path/to/gopls-fleet" }
+}
+```
+
+### Neovim (nvim-lspconfig)
+
+```lua
+require("lspconfig").gopls.setup({
+  cmd = { "gopls-fleet" },
+})
+```
+
+Other gopls settings pass through untouched (the proxy patches
+`initialize` options and `workspace/configuration` responses only).
 
 ## Measured on a production monorepo (24k Go files, single go.mod, cold cache)
 
@@ -54,12 +81,26 @@ gopls-fleet [-gopls /path/to/gopls] [-granularity 3] [-debounce 500ms] [-driver=
 The proxy spends ~13s of background CPU once per session building the graph
 cache and ~1.6s building the reverse-import index; both are included above.
 
+## Scope lifecycle
+
+- Opening a file adds its scope unit; closing all files in a unit evicts it
+  after `-evict` (default 10m) of inactivity.
+- rename/references resolve the symbol's defining package first (a
+  definition request to gopls), then expand to its reverse-import closure.
+- Method symbols and `implementation` requests temporarily widen to the
+  whole workspace — methods can be reached through interfaces from packages
+  that never import the defining package, so the closure is not enough. The
+  widening expires after the eviction TTL.
+- `//go:embed` directive changes and non-Go file events invalidate the graph
+  cache (it rebuilds in the background; queries fall back to go list until
+  it is fresh).
+
 ## Current limitations
 
-- The scope only grows during a session; closed services are not evicted.
-- Method renames on types that flow far from their package may still need a
-  wider scope than the reverse-import closure of the defining package
-  (interface satisfaction across packages). When in doubt, verify with a
-  workspace-wide grep before landing a rename.
-- `//go:embed` pattern changes do not invalidate the graph cache until the
-  next import-affecting save.
+- References at a call site resolve through `textDocument/definition`; if
+  the definition itself is not resolvable in the current scope (rare: the
+  requesting file's package always has its dependencies loaded), the proxy
+  falls back to the requesting file's package for closure computation.
+- A whole-workspace widening on a big monorepo costs what plain gopls costs
+  on every startup; with a warm gopls cache it is seconds, cold it can be
+  minutes of background CPU.

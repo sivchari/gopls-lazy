@@ -194,8 +194,10 @@ func (ri *revIndex) ClosureUnits(relDir string, granularity int) []string {
 	return out
 }
 
-// parseImports extracts all import paths of a Go source file, plus the
-// subset that refers to workspace-internal packages (as rel dirs).
+// parseImports extracts the metadata-relevant signature of a Go source
+// file: all import paths plus //go:embed directives (both change the
+// package graph), and the subset of imports that refers to
+// workspace-internal packages (as rel dirs).
 func parseImports(src []byte, modPath string) (all, internal []string) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, "x.go", src, parser.ImportsOnly)
@@ -215,6 +217,14 @@ func parseImports(src []byte, modPath string) (all, internal []string) {
 			internal = append(internal, ".")
 		} else if strings.HasPrefix(p, modPath+"/") {
 			internal = append(internal, p[len(modPath)+1:])
+		}
+	}
+	// ImportsOnly stops at the import block, so scan the raw source for
+	// embed directives. The marker prefix cannot collide with import paths.
+	for line := range strings.Lines(string(src)) {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "//go:embed") {
+			all = append(all, "\x00embed:"+t)
 		}
 	}
 	sort.Strings(all)

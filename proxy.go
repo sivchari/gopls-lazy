@@ -24,20 +24,29 @@ type message struct {
 	Error   json.RawMessage `json:"error,omitempty"`
 }
 
+// scopeEntry tracks why a unit is in scope: the open files inside it, and
+// when it was last useful, so idle units can be evicted.
+type scopeEntry struct {
+	open       map[string]bool
+	lastActive time.Time
+}
+
 type proxy struct {
-	granularity int
-	debounce    time.Duration
-	useDriver   bool
+	opts options
 
 	mu           sync.Mutex
-	root         string          // workspace root filesystem path
-	scope        map[string]bool // scope units relative to root
-	configIDs    map[string]bool // ids of pending server->client workspace/configuration requests
-	pendingDiag  map[string]bool // opened uris whose first diagnostics have not arrived yet
+	root         string                 // workspace root filesystem path
+	scope        map[string]*scopeEntry // scope units relative to root
+	fullUntil    time.Time              // while set, the whole workspace is in scope
+	userFilters  []string               // editor's own directoryFilters, restored for full scope
+	configIDs    map[string]bool        // ids of pending server->client workspace/configuration requests
+	pendingDiag  map[string]bool        // opened uris whose first diagnostics have not arrived yet
 	rescopeTimer *time.Timer
-	held         [][]byte // cross-reference requests waiting for the re-scoped view
+	held         [][]byte // requests waiting for the re-scoped view
 	awaitingLoad bool     // a held-triggered rescope is in flight
 	holdTimer    *time.Timer
+	pendingOwn   map[string]chan *message // proxy-originated request ids -> response channel
+	ownSeq       int
 
 	idx   *revIndex
 	graph *graphServer
@@ -47,10 +56,11 @@ type proxy struct {
 	log      *log.Logger
 }
 
-func (p *proxy) run(goplsPath string) int {
-	cmd := exec.Command(goplsPath, "serve")
+func (p *proxy) run() int {
+	args := p.opts.goplsArgs
+	cmd := exec.Command(p.opts.gopls, args...)
 	cmd.Env = os.Environ()
-	if p.useDriver {
+	if p.opts.driver {
 		g, err := startGraphServer(p.idx, p.log)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gopls-fleet: graph server: %v (continuing without driver)\n", err)
@@ -84,6 +94,10 @@ func (p *proxy) run(goplsPath string) int {
 	p.toServer = newFrameWriter(serverIn)
 	p.toClient = newFrameWriter(os.Stdout)
 
+	if p.opts.evictTTL > 0 {
+		go p.evictLoop()
+	}
+
 	done := make(chan struct{}, 2)
 	go func() { p.pumpClient(bufio.NewReaderSize(os.Stdin, 1<<20)); done <- struct{}{} }()
 	go func() { p.pumpServer(bufio.NewReaderSize(serverOut, 1<<20)); done <- struct{}{} }()
@@ -95,7 +109,7 @@ func (p *proxy) run(goplsPath string) int {
 
 // pumpClient forwards editor->gopls traffic, patching initialize options and
 // configuration responses, growing the scope on didOpen, and holding
-// cross-reference requests until the scope covers their reverse importers.
+// cross-reference requests until the scope covers their target.
 func (p *proxy) pumpClient(r *bufio.Reader) {
 	for {
 		raw, err := readFrame(r)
@@ -112,6 +126,8 @@ func (p *proxy) pumpClient(r *bufio.Reader) {
 			raw = p.patchInitialize(raw, &m)
 		case m.Method == "textDocument/didOpen":
 			p.observeOpen(m.Params)
+		case m.Method == "textDocument/didClose":
+			p.observeClose(m.Params)
 		case m.Method == "textDocument/didSave":
 			p.observeFileEvent(docURI(m.Params))
 		case m.Method == "workspace/didChangeWatchedFiles":
@@ -136,9 +152,10 @@ func (p *proxy) pumpClient(r *bufio.Reader) {
 }
 
 // pumpServer forwards gopls->editor traffic. It remembers ids of
-// workspace/configuration requests, fires the second stage of a two-stage
-// rescope once orphan diagnostics arrive, and releases held requests when
-// the re-scoped metadata load completes.
+// workspace/configuration requests, routes responses to proxy-originated
+// requests, fires the second stage of a two-stage rescope once orphan
+// diagnostics arrive, and releases held requests when the re-scoped
+// metadata load completes.
 func (p *proxy) pumpServer(r *bufio.Reader) {
 	for {
 		raw, err := readFrame(r)
@@ -147,6 +164,16 @@ func (p *proxy) pumpServer(r *bufio.Reader) {
 		}
 		var m message
 		if json.Unmarshal(raw, &m) == nil {
+			if m.Method == "" && m.ID != nil {
+				p.mu.Lock()
+				ch := p.pendingOwn[string(m.ID)]
+				delete(p.pendingOwn, string(m.ID))
+				p.mu.Unlock()
+				if ch != nil {
+					ch <- &m
+					continue // proxy-originated; not for the editor
+				}
+			}
 			switch m.Method {
 			case "workspace/configuration":
 				if m.ID != nil {
@@ -198,8 +225,9 @@ func (p *proxy) patchInitialize(raw []byte, m *message) []byte {
 	if opts == nil {
 		opts = map[string]any{}
 	}
+	p.captureUserFilters(opts)
 	p.mu.Lock()
-	opts["directoryFilters"] = p.filters()
+	setFilters(opts, p.filtersLocked())
 	p.mu.Unlock()
 	params["initializationOptions"] = opts
 	patched, err := json.Marshal(params)
@@ -223,15 +251,20 @@ func (p *proxy) patchConfigResponse(raw []byte, m *message) []byte {
 	if json.Unmarshal(m.Result, &items) != nil {
 		return raw
 	}
+	for _, it := range items {
+		if obj, _ := it.(map[string]any); obj != nil {
+			p.captureUserFilters(obj)
+		}
+	}
 	p.mu.Lock()
-	fs := p.filters()
+	fs := p.filtersLocked()
 	p.mu.Unlock()
 	for i, it := range items {
 		obj, _ := it.(map[string]any)
 		if obj == nil {
 			obj = map[string]any{}
 		}
-		obj["directoryFilters"] = fs
+		setFilters(obj, fs)
 		items[i] = obj
 	}
 	patched, err := json.Marshal(items)
@@ -245,6 +278,30 @@ func (p *proxy) patchConfigResponse(raw []byte, m *message) []byte {
 	}
 	p.log.Printf("configuration response patched: filters=%v", fs)
 	return out
+}
+
+// captureUserFilters remembers the editor's own directoryFilters so they can
+// be restored when the proxy temporarily widens to the whole workspace.
+func (p *proxy) captureUserFilters(settings map[string]any) {
+	v, ok := settings["directoryFilters"]
+	if !ok {
+		return
+	}
+	arr, ok := v.([]any)
+	if !ok {
+		return
+	}
+	var fs []string
+	for _, e := range arr {
+		if s, ok := e.(string); ok {
+			fs = append(fs, s)
+		}
+	}
+	if len(fs) > 0 && fs[0] != "-**" { // ignore our own injected value
+		p.mu.Lock()
+		p.userFilters = fs
+		p.mu.Unlock()
+	}
 }
 
 func docURI(params json.RawMessage) string {
@@ -275,14 +332,60 @@ func (p *proxy) observeOpen(params json.RawMessage) {
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if p.scope[unit] {
+	if e := p.scope[unit]; e != nil {
+		e.open[uri] = true
+		e.lastActive = time.Now()
 		return
 	}
-	p.scope[unit] = true
+	p.scope[unit] = &scopeEntry{open: map[string]bool{uri: true}, lastActive: time.Now()}
 	p.pendingDiag[uri] = true
 	p.log.Printf("scope += %s (open, waiting for orphan diagnostics)", unit)
 	uriCopy := uri
 	time.AfterFunc(3*time.Second, func() { p.diagArrived(uriCopy, "timeout") })
+}
+
+func (p *proxy) observeClose(params json.RawMessage) {
+	uri := docURI(params)
+	path := uriToPath(uri)
+	unit, ok := p.unitFor(path)
+	if !ok {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e := p.scope[unit]; e != nil {
+		delete(e.open, uri)
+		e.lastActive = time.Now()
+	}
+}
+
+// evictLoop drops scope units that have had no open files for the TTL, and
+// ends temporary whole-workspace widenings.
+func (p *proxy) evictLoop() {
+	ttl := p.opts.evictTTL
+	tick := time.NewTicker(time.Minute)
+	defer tick.Stop()
+	for range tick.C {
+		now := time.Now()
+		p.mu.Lock()
+		changed := false
+		for unit, e := range p.scope {
+			if len(e.open) == 0 && now.Sub(e.lastActive) > ttl {
+				delete(p.scope, unit)
+				p.log.Printf("scope -= %s (idle %s)", unit, ttl)
+				changed = true
+			}
+		}
+		if !p.fullUntil.IsZero() && now.After(p.fullUntil) {
+			p.fullUntil = time.Time{}
+			p.log.Printf("full-workspace widening expired")
+			changed = true
+		}
+		p.mu.Unlock()
+		if changed {
+			p.pushScope()
+		}
+	}
 }
 
 func (p *proxy) onDiagnostics(params json.RawMessage) {
@@ -306,75 +409,8 @@ func (p *proxy) diagArrived(uri, why string) {
 	if p.rescopeTimer != nil {
 		p.rescopeTimer.Stop()
 	}
-	p.rescopeTimer = time.AfterFunc(p.debounce, p.pushScope)
+	p.rescopeTimer = time.AfterFunc(p.opts.debounce, p.pushScope)
 	p.mu.Unlock()
-}
-
-// interceptCrossRef expands the scope with the reverse-import closure of the
-// request's target package and holds the request until the re-scoped view
-// has loaded, so rename/references see every affected package. Returns true
-// if the request was held.
-func (p *proxy) interceptCrossRef(raw []byte, m *message) bool {
-	path := uriToPath(docURI(m.Params))
-	p.mu.Lock()
-	root := p.root
-	p.mu.Unlock()
-	if root == "" || !strings.HasPrefix(path, root+string(filepath.Separator)) {
-		return false
-	}
-	rel, err := filepath.Rel(root, filepath.Dir(path))
-	if err != nil || strings.HasPrefix(rel, "..") {
-		return false
-	}
-	rel = filepath.ToSlash(rel)
-
-	if !p.idx.Ready() {
-		// Index still building: hold the request in a goroutine and decide
-		// once it is ready (cross-reference requests are rare and the editor
-		// blocks on them anyway).
-		held := append([]byte(nil), raw...)
-		go func() {
-			if !p.idx.WaitReady(30 * time.Second) {
-				p.log.Printf("crossref %s: index not ready in time, forwarding as-is", m.Method)
-				p.toServer.write(held)
-				return
-			}
-			if !p.expandForCrossRef(rel, m.Method, held) {
-				p.toServer.write(held)
-			}
-		}()
-		return true
-	}
-	return p.expandForCrossRef(rel, m.Method, raw)
-}
-
-// expandForCrossRef returns true if the request was held pending a rescope.
-func (p *proxy) expandForCrossRef(relDir, method string, raw []byte) bool {
-	units := p.idx.ClosureUnits(relDir, p.granularity)
-	p.mu.Lock()
-	var need []string
-	for _, u := range units {
-		if !p.scope[u] {
-			need = append(need, u)
-		}
-	}
-	if len(need) == 0 {
-		p.mu.Unlock()
-		return false
-	}
-	for _, u := range need {
-		p.scope[u] = true
-	}
-	p.held = append(p.held, append([]byte(nil), raw...))
-	p.awaitingLoad = true
-	if p.holdTimer != nil {
-		p.holdTimer.Stop()
-	}
-	p.holdTimer = time.AfterFunc(60*time.Second, func() { p.flushHeld("timeout") })
-	p.log.Printf("crossref %s in %s: scope += %v, holding request", method, relDir, need)
-	p.mu.Unlock()
-	p.pushScope()
-	return true
 }
 
 // onLogMessage watches gopls's own log for the go/packages.Load line that
@@ -436,12 +472,17 @@ func (p *proxy) observeFileEvent(uri string) {
 		return
 	}
 	if !strings.HasSuffix(path, ".go") {
+		// Possibly an embedded asset (//go:embed): the package graph's
+		// EmbedFiles may have changed.
+		if p.graph != nil {
+			p.graph.MarkStale("non-go file changed: " + base)
+		}
 		return
 	}
 	go func() {
 		changed := p.idx.UpdateFile(path)
 		if changed && p.graph != nil {
-			p.graph.MarkStale("imports changed: " + path)
+			p.graph.MarkStale("imports or embed directives changed: " + path)
 		}
 	}()
 }

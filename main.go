@@ -12,38 +12,162 @@
 //
 //   - Opened files first get orphan-mode diagnostics from gopls, and the
 //     workspace is re-scoped right after, so feedback stays fast.
-//   - rename/references requests are held while the scope is expanded with
-//     the reverse-import closure of the target package, so results are not
-//     silently truncated to the current scope.
+//   - rename/references/implementation requests are resolved to their
+//     defining package and held while the scope is expanded with its
+//     reverse-import closure (or the whole workspace for method symbols,
+//     which can be referenced through interfaces from anywhere), so results
+//     are not silently truncated.
+//   - Scope units with no open files are evicted after a TTL.
 //   - The same binary acts as a GOPACKAGESDRIVER (when gopls invokes it) and
 //     serves the package graph from an in-proxy cache, eliminating repeated
 //     `go list ./...` runs on every re-scope.
 package main
 
 import (
-	"flag"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"strconv"
 	"time"
 )
 
+type options struct {
+	gopls       string
+	granularity int
+	debounce    time.Duration
+	evictTTL    time.Duration // 0 disables eviction
+	driver      bool
+	logPath     string
+	goplsArgs   []string // unrecognized flags, forwarded to gopls
+}
+
+// parseArgs understands gopls-fleet's own flags and forwards everything else
+// to gopls (editors like VS Code pass extra flags to the configured "gopls"
+// binary). Defaults can also come from GOPLS_FLEET_* environment variables,
+// for editor configs that cannot pass arguments.
+func parseArgs(args []string, getenv func(string) string) (options, error) {
+	o := options{
+		gopls:       "gopls",
+		granularity: 3,
+		debounce:    500 * time.Millisecond,
+		evictTTL:    10 * time.Minute,
+		driver:      true,
+	}
+	if v := getenv("GOPLS_FLEET_GOPLS"); v != "" {
+		o.gopls = v
+	}
+	if v := getenv("GOPLS_FLEET_GRANULARITY"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return o, fmt.Errorf("GOPLS_FLEET_GRANULARITY: %w", err)
+		}
+		o.granularity = n
+	}
+	if v := getenv("GOPLS_FLEET_DEBOUNCE"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return o, fmt.Errorf("GOPLS_FLEET_DEBOUNCE: %w", err)
+		}
+		o.debounce = d
+	}
+	if v := getenv("GOPLS_FLEET_EVICT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return o, fmt.Errorf("GOPLS_FLEET_EVICT: %w", err)
+		}
+		o.evictTTL = d
+	}
+	if v := getenv("GOPLS_FLEET_DRIVER"); v != "" && v != "1" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return o, fmt.Errorf("GOPLS_FLEET_DRIVER: %w", err)
+		}
+		o.driver = b
+	}
+	if v := getenv("GOPLS_FLEET_LOG"); v != "" {
+		o.logPath = v
+	}
+
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		name, value, hasValue := arg, "", false
+		if k, v, ok := cutFlagValue(arg); ok {
+			name, value, hasValue = k, v, true
+		}
+		next := func() (string, error) {
+			if hasValue {
+				return value, nil
+			}
+			i++
+			if i >= len(args) {
+				return "", fmt.Errorf("flag %s needs a value", name)
+			}
+			return args[i], nil
+		}
+		var err error
+		switch name {
+		case "-gopls", "--gopls":
+			o.gopls, err = next()
+		case "-granularity", "--granularity":
+			var v string
+			if v, err = next(); err == nil {
+				o.granularity, err = strconv.Atoi(v)
+			}
+		case "-debounce", "--debounce":
+			var v string
+			if v, err = next(); err == nil {
+				o.debounce, err = time.ParseDuration(v)
+			}
+		case "-evict", "--evict":
+			var v string
+			if v, err = next(); err == nil {
+				o.evictTTL, err = time.ParseDuration(v)
+			}
+		case "-driver", "--driver":
+			if hasValue {
+				o.driver, err = strconv.ParseBool(value)
+			} else {
+				o.driver = true
+			}
+		case "-log", "--log":
+			o.logPath, err = next()
+		default:
+			o.goplsArgs = append(o.goplsArgs, arg)
+		}
+		if err != nil {
+			return o, fmt.Errorf("flag %s: %w", name, err)
+		}
+	}
+	return o, nil
+}
+
+func cutFlagValue(arg string) (name, value string, ok bool) {
+	if len(arg) == 0 || arg[0] != '-' {
+		return arg, "", false
+	}
+	for i := 1; i < len(arg); i++ {
+		if arg[i] == '=' {
+			return arg[:i], arg[i+1:], true
+		}
+	}
+	return arg, "", false
+}
+
 func main() {
-	if os.Getenv("GOPLS_FLEET_DRIVER") == "1" {
+	if os.Getenv("GOPLS_FLEET_DRIVER") == "1" && os.Getenv("GOPLS_FLEET_SOCK") != "" {
 		os.Exit(runDriver())
 	}
 
-	goplsPath := flag.String("gopls", "gopls", "path to the gopls binary")
-	granularity := flag.Int("granularity", 3, "number of path segments that form one scope unit (e.g. 3 = go/services/auth)")
-	debounce := flag.Duration("debounce", 500*time.Millisecond, "delay before applying a scope change, coalescing bursts of didOpen")
-	driver := flag.Bool("driver", true, "serve the package graph to gopls via GOPACKAGESDRIVER (kills repeated go list runs)")
-	logPath := flag.String("log", "", "debug log file (default: no logging)")
-	flag.Parse()
+	opts, err := parseArgs(os.Args[1:], os.Getenv)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "gopls-fleet: %v\n", err)
+		os.Exit(2)
+	}
 
 	logger := log.New(io.Discard, "", log.LstdFlags|log.Lmicroseconds)
-	if *logPath != "" {
-		f, err := os.OpenFile(*logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if opts.logPath != "" {
+		f, err := os.OpenFile(opts.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gopls-fleet: open log: %v\n", err)
 			os.Exit(1)
@@ -53,14 +177,13 @@ func main() {
 	}
 
 	p := &proxy{
-		granularity: *granularity,
-		debounce:    *debounce,
-		useDriver:   *driver,
-		scope:       map[string]bool{},
+		opts:        opts,
+		scope:       map[string]*scopeEntry{},
 		configIDs:   map[string]bool{},
 		pendingDiag: map[string]bool{},
+		pendingOwn:  map[string]chan *message{},
 		idx:         newRevIndex(logger),
 		log:         logger,
 	}
-	os.Exit(p.run(*goplsPath))
+	os.Exit(p.run())
 }

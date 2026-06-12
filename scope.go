@@ -7,7 +7,18 @@ import (
 	"strings"
 )
 
-func (p *proxy) filters() []string {
+// filtersLocked returns the directoryFilters for the current scope. The
+// caller must hold p.mu. During a temporary whole-workspace widening it
+// returns the editor's own filters (or the gopls default): the key must be
+// SET explicitly, because gopls layers workspace/configuration over
+// initializationOptions and an absent key would keep the old value.
+func (p *proxy) filtersLocked() []string {
+	if !p.fullUntil.IsZero() {
+		if len(p.userFilters) > 0 {
+			return p.userFilters
+		}
+		return []string{"-**/node_modules"}
+	}
 	dirs := make([]string, 0, len(p.scope))
 	for d := range p.scope {
 		dirs = append(dirs, d)
@@ -18,6 +29,11 @@ func (p *proxy) filters() []string {
 		fs = append(fs, "+"+d)
 	}
 	return fs
+}
+
+// setFilters applies the proxy's filters to a gopls settings object.
+func setFilters(settings map[string]any, filters []string) {
+	settings["directoryFilters"] = filters
 }
 
 // unitFor maps an absolute file path to its scope unit relative to the
@@ -33,7 +49,7 @@ func (p *proxy) unitFor(path string) (string, bool) {
 	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
 		return "", false
 	}
-	return scopeUnit(filepath.ToSlash(rel), p.granularity), true
+	return scopeUnit(filepath.ToSlash(rel), p.opts.granularity), true
 }
 
 // pushScope tells gopls that configuration changed; gopls then re-requests
@@ -49,7 +65,11 @@ func (p *proxy) pushScope() {
 		return
 	}
 	p.mu.Lock()
-	p.log.Printf("rescope: filters=%v", p.filters())
+	if !p.fullUntil.IsZero() {
+		p.log.Printf("rescope: full workspace via %v (until %s)", p.filtersLocked(), p.fullUntil.Format("15:04:05"))
+	} else {
+		p.log.Printf("rescope: filters=%v", p.filtersLocked())
+	}
 	p.mu.Unlock()
 	p.toServer.write(raw)
 }
