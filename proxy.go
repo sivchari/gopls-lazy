@@ -220,6 +220,11 @@ func (p *proxy) patchInitialize(raw []byte, m *message) []byte {
 	p.mu.Unlock()
 	if root != "" {
 		go p.idx.Build(root)
+		if p.graph != nil {
+			// Set root now so the disk cache is ready before gopls's first
+			// GOPACKAGESDRIVER call during IWL.
+			p.graph.setRoot(root)
+		}
 	}
 	opts, _ := params["initializationOptions"].(map[string]any)
 	if opts == nil {
@@ -316,10 +321,19 @@ func docURI(params json.RawMessage) string {
 	return dp.TextDocument.URI
 }
 
-// observeOpen grows the scope for a newly opened file. The rescope is NOT
-// pushed immediately: gopls first serves the file in orphan mode (fast
-// diagnostics), and the rescope fires once those diagnostics arrive (or
-// after a fallback timeout), so the view reload never delays first feedback.
+// observeOpen grows the scope for a newly opened file.
+//
+// Two-stage rescope: when there is already something in scope, gopls can
+// serve the file in orphan mode (fast syntax diagnostics without loading the
+// package). The second-stage rescope fires after those diagnostics arrive so
+// the view reload never blocks the first feedback. A 3-second fallback timer
+// handles files that produce no orphan diagnostics (e.g. generated stubs).
+//
+// First-file shortcut: when the scope is empty the workspace filter is
+// "-**", which excludes everything. Gopls produces no orphan diagnostics in
+// this state, so waiting for them would add a 3-second dead zone before the
+// real type-check even starts. We skip the wait and push the rescope after
+// a single debounce tick instead, which batches multiple simultaneous opens.
 func (p *proxy) observeOpen(params json.RawMessage) {
 	uri := docURI(params)
 	path := uriToPath(uri)
@@ -337,11 +351,22 @@ func (p *proxy) observeOpen(params json.RawMessage) {
 		e.lastActive = time.Now()
 		return
 	}
+	wasEmpty := len(p.scope) == 0
 	p.scope[unit] = &scopeEntry{open: map[string]bool{uri: true}, lastActive: time.Now()}
-	p.pendingDiag[uri] = true
-	p.log.Printf("scope += %s (open, waiting for orphan diagnostics)", unit)
-	uriCopy := uri
-	time.AfterFunc(3*time.Second, func() { p.diagArrived(uriCopy, "timeout") })
+	if wasEmpty {
+		// Scope was empty: skip two-stage, rescope after one debounce tick
+		// so simultaneous opens are still batched.
+		p.log.Printf("scope += %s (first open, immediate rescope)", unit)
+		if p.rescopeTimer != nil {
+			p.rescopeTimer.Stop()
+		}
+		p.rescopeTimer = time.AfterFunc(p.opts.debounce, p.pushScope)
+	} else {
+		p.pendingDiag[uri] = true
+		p.log.Printf("scope += %s (open, waiting for orphan diagnostics)", unit)
+		uriCopy := uri
+		time.AfterFunc(3*time.Second, func() { p.diagArrived(uriCopy, "timeout") })
+	}
 }
 
 func (p *proxy) observeClose(params json.RawMessage) {
