@@ -180,6 +180,7 @@ func (p *proxy) pumpServer(r *bufio.Reader) {
 					p.mu.Lock()
 					p.configIDs[string(m.ID)] = true
 					p.mu.Unlock()
+					p.log.Printf("workspace/configuration request id=%s params=%s", m.ID, truncate(m.Params, 300))
 				}
 			case "textDocument/publishDiagnostics":
 				p.onDiagnostics(m.Params)
@@ -250,7 +251,10 @@ func (p *proxy) patchInitialize(raw []byte, m *message) []byte {
 	if err != nil {
 		return raw
 	}
-	p.log.Printf("initialize: root=%s filters=%v", root, opts["directoryFilters"])
+	// Log what initializationOptions looked like BEFORE patching (first 300 chars
+	// is enough to see whether settings are nested under "gopls" or flat).
+	rawOpts, _ := json.Marshal(params["initializationOptions"])
+	p.log.Printf("initialize: root=%s filters=%v rawInitOpts=%s", root, opts["directoryFilters"], truncate(rawOpts, 300))
 	return out
 }
 
@@ -287,7 +291,7 @@ func (p *proxy) patchConfigResponse(raw []byte, m *message) []byte {
 	if err != nil {
 		return raw
 	}
-	p.log.Printf("configuration response patched: filters=%v", fs)
+	p.log.Printf("configuration response patched: filters=%v result=%s", fs, truncate(m.Result, 400))
 	return out
 }
 
@@ -530,6 +534,14 @@ func (p *proxy) observeWatchedFiles(params json.RawMessage) {
 	for _, ch := range wp.Changes {
 		p.observeFileEvent(ch.URI)
 	}
+}
+
+func truncate(b json.RawMessage, n int) string {
+	s := string(b)
+	if len(s) > n {
+		return s[:n] + "…"
+	}
+	return s
 }
 
 func uriToPath(uri string) string {
