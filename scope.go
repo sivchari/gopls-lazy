@@ -26,6 +26,21 @@ func (p *proxy) filtersLocked() []string {
 		dirs = append(dirs, d)
 	}
 	sort.Strings(dirs)
+
+	// If any open file lives at the workspace root (unit "."), gopls has no
+	// filter pattern that matches the root directory alone. Fall back to no
+	// filters so gopls loads the full workspace. This is correct for small
+	// repos (like gopls-fleet itself) and acceptable for large repos where
+	// root-level Go files are uncommon.
+	for _, d := range dirs {
+		if d == "." {
+			if len(p.userFilters) > 0 {
+				return p.userFilters
+			}
+			return []string{}
+		}
+	}
+
 	fs := []string{"-**"}
 	for _, d := range dirs {
 		fs = append(fs, "+"+d)
@@ -39,7 +54,8 @@ func setFilters(settings map[string]any, filters []string) {
 }
 
 // unitFor maps an absolute file path to its scope unit relative to the
-// workspace root.
+// workspace root.  Files that live directly in the workspace root are mapped
+// to the special unit "." (the root).
 func (p *proxy) unitFor(path string) (string, bool) {
 	p.mu.Lock()
 	root := p.root
@@ -48,8 +64,13 @@ func (p *proxy) unitFor(path string) (string, bool) {
 		return "", false
 	}
 	rel, err := filepath.Rel(root, filepath.Dir(path))
-	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+	if err != nil || strings.HasPrefix(rel, "..") {
 		return "", false
+	}
+	if rel == "." {
+		// File is directly in the workspace root (e.g. main.go in a small
+		// single-package repo). Represent it as the root unit ".".
+		return ".", true
 	}
 	return scopeUnit(filepath.ToSlash(rel), p.opts.granularity), true
 }
