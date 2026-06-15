@@ -63,15 +63,15 @@ func (p *proxy) run() int {
 	if p.opts.driver {
 		g, err := startGraphServer(p.idx, p.log)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "gopls-fleet: graph server: %v (continuing without driver)\n", err)
+			fmt.Fprintf(os.Stderr, "gopls-lazy: graph server: %v (continuing without driver)\n", err)
 		} else {
 			p.graph = g
 			exe, err := os.Executable()
 			if err == nil {
 				cmd.Env = append(cmd.Env,
 					"GOPACKAGESDRIVER="+exe,
-					"GOPLS_FLEET_DRIVER=1",
-					"GOPLS_FLEET_SOCK="+g.sockPath,
+					"GOPLS_LAZY_DRIVER=1",
+					"GOPLS_LAZY_SOCK="+g.sockPath,
 				)
 			}
 		}
@@ -79,16 +79,16 @@ func (p *proxy) run() int {
 	cmd.Stderr = os.Stderr
 	serverIn, err := cmd.StdinPipe()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "gopls-fleet: %v\n", err)
+		fmt.Fprintf(os.Stderr, "gopls-lazy: %v\n", err)
 		return 1
 	}
 	serverOut, err := cmd.StdoutPipe()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "gopls-fleet: %v\n", err)
+		fmt.Fprintf(os.Stderr, "gopls-lazy: %v\n", err)
 		return 1
 	}
 	if err := cmd.Start(); err != nil {
-		fmt.Fprintf(os.Stderr, "gopls-fleet: start gopls: %v\n", err)
+		fmt.Fprintf(os.Stderr, "gopls-lazy: start gopls: %v\n", err)
 		return 1
 	}
 	p.toServer = newFrameWriter(serverIn)

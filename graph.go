@@ -25,7 +25,7 @@ import (
 // answer confidently is delegated back to the real go list via NotHandled.
 //
 // Disk cache: after each successful build the graph is written to
-// $XDG_CACHE_HOME/gopls-fleet/graph-<root-hash>.json. On the next startup
+// $XDG_CACHE_HOME/gopls-lazy/graph-<root-hash>.json. On the next startup
 // the cached graph is loaded immediately so the first workspace query is
 // served from disk (µs) rather than from a fresh `go list ./...` (13+ s).
 // A background rebuild starts in parallel to validate / refresh the cache.
@@ -103,7 +103,7 @@ func graphCacheFile(root string) string {
 	if err != nil {
 		base = filepath.Join(os.Getenv("HOME"), ".cache")
 	}
-	return filepath.Join(base, "gopls-fleet", fmt.Sprintf("graph-%x.json", h[:8]))
+	return filepath.Join(base, "gopls-lazy", fmt.Sprintf("graph-%x.json", h[:8]))
 }
 
 type driverQuery struct {
@@ -116,7 +116,7 @@ type driverQuery struct {
 // Call setRoot once the workspace root is known (on initialize) so the
 // on-disk cache can be located and loaded before the first driver query.
 func startGraphServer(idx *revIndex, logger *log.Logger) (*graphServer, error) {
-	sock := filepath.Join(os.TempDir(), fmt.Sprintf("gopls-fleet-%d.sock", os.Getpid()))
+	sock := filepath.Join(os.TempDir(), fmt.Sprintf("gopls-lazy-%d.sock", os.Getpid()))
 	_ = os.Remove(sock)
 	ln, err := net.Listen("unix", sock)
 	if err != nil {

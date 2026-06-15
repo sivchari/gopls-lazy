@@ -1,4 +1,4 @@
-module github.com/sivchari/gopls-fleet
+module github.com/sivchari/gopls-lazy
 
 go 1.26.4
 

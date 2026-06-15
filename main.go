@@ -1,4 +1,4 @@
-// gopls-fleet is an LSP stdio proxy that sits between an editor and gopls
+// gopls-lazy is an LSP stdio proxy that sits between an editor and gopls
 // and dynamically narrows the gopls workspace to the directories the user is
 // actually editing, via directoryFilters.
 //
@@ -42,9 +42,9 @@ type options struct {
 	goplsArgs   []string // unrecognized flags, forwarded to gopls
 }
 
-// parseArgs understands gopls-fleet's own flags and forwards everything else
+// parseArgs understands gopls-lazy's own flags and forwards everything else
 // to gopls (editors like VS Code pass extra flags to the configured "gopls"
-// binary). Defaults can also come from GOPLS_FLEET_* environment variables,
+// binary). Defaults can also come from GOPLS_LAZY_* environment variables,
 // for editor configs that cannot pass arguments.
 func parseArgs(args []string, getenv func(string) string) (options, error) {
 	o := options{
@@ -54,38 +54,38 @@ func parseArgs(args []string, getenv func(string) string) (options, error) {
 		evictTTL:    10 * time.Minute,
 		driver:      true,
 	}
-	if v := getenv("GOPLS_FLEET_GOPLS"); v != "" {
+	if v := getenv("GOPLS_LAZY_GOPLS"); v != "" {
 		o.gopls = v
 	}
-	if v := getenv("GOPLS_FLEET_GRANULARITY"); v != "" {
+	if v := getenv("GOPLS_LAZY_GRANULARITY"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return o, fmt.Errorf("GOPLS_FLEET_GRANULARITY: %w", err)
+			return o, fmt.Errorf("GOPLS_LAZY_GRANULARITY: %w", err)
 		}
 		o.granularity = n
 	}
-	if v := getenv("GOPLS_FLEET_DEBOUNCE"); v != "" {
+	if v := getenv("GOPLS_LAZY_DEBOUNCE"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return o, fmt.Errorf("GOPLS_FLEET_DEBOUNCE: %w", err)
+			return o, fmt.Errorf("GOPLS_LAZY_DEBOUNCE: %w", err)
 		}
 		o.debounce = d
 	}
-	if v := getenv("GOPLS_FLEET_EVICT"); v != "" {
+	if v := getenv("GOPLS_LAZY_EVICT"); v != "" {
 		d, err := time.ParseDuration(v)
 		if err != nil {
-			return o, fmt.Errorf("GOPLS_FLEET_EVICT: %w", err)
+			return o, fmt.Errorf("GOPLS_LAZY_EVICT: %w", err)
 		}
 		o.evictTTL = d
 	}
-	if v := getenv("GOPLS_FLEET_DRIVER"); v != "" && v != "1" {
+	if v := getenv("GOPLS_LAZY_DRIVER"); v != "" && v != "1" {
 		b, err := strconv.ParseBool(v)
 		if err != nil {
-			return o, fmt.Errorf("GOPLS_FLEET_DRIVER: %w", err)
+			return o, fmt.Errorf("GOPLS_LAZY_DRIVER: %w", err)
 		}
 		o.driver = b
 	}
-	if v := getenv("GOPLS_FLEET_LOG"); v != "" {
+	if v := getenv("GOPLS_LAZY_LOG"); v != "" {
 		o.logPath = v
 	}
 
@@ -155,13 +155,13 @@ func cutFlagValue(arg string) (name, value string, ok bool) {
 }
 
 func main() {
-	if os.Getenv("GOPLS_FLEET_DRIVER") == "1" && os.Getenv("GOPLS_FLEET_SOCK") != "" {
+	if os.Getenv("GOPLS_LAZY_DRIVER") == "1" && os.Getenv("GOPLS_LAZY_SOCK") != "" {
 		os.Exit(runDriver())
 	}
 
 	opts, err := parseArgs(os.Args[1:], os.Getenv)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "gopls-fleet: %v\n", err)
+		fmt.Fprintf(os.Stderr, "gopls-lazy: %v\n", err)
 		os.Exit(2)
 	}
 
@@ -169,7 +169,7 @@ func main() {
 	if opts.logPath != "" {
 		f, err := os.OpenFile(opts.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "gopls-fleet: open log: %v\n", err)
+			fmt.Fprintf(os.Stderr, "gopls-lazy: open log: %v\n", err)
 			os.Exit(1)
 		}
 		defer f.Close()

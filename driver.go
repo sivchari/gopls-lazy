@@ -18,7 +18,7 @@ func runDriver() int {
 	if err != nil {
 		return writeNotHandled()
 	}
-	sock := os.Getenv("GOPLS_FLEET_SOCK")
+	sock := os.Getenv("GOPLS_LAZY_SOCK")
 	if sock == "" {
 		return writeNotHandled()
 	}

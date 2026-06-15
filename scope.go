@@ -30,7 +30,7 @@ func (p *proxy) filtersLocked() []string {
 	// If any open file lives at the workspace root (unit "."), gopls has no
 	// filter pattern that matches the root directory alone. Fall back to no
 	// filters so gopls loads the full workspace. This is correct for small
-	// repos (like gopls-fleet itself) and acceptable for large repos where
+	// repos (like gopls-lazy itself) and acceptable for large repos where
 	// root-level Go files are uncommon.
 	for _, d := range dirs {
 		if d == "." {
