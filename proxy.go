@@ -221,10 +221,16 @@ func (p *proxy) patchInitialize(raw []byte, m *message) []byte {
 	if root != "" {
 		go p.idx.Build(root)
 		if p.graph != nil {
-			// Set root now so the disk cache is ready before gopls's first
+			// Set root so the disk cache is ready before gopls's first
 			// GOPACKAGESDRIVER call during IWL.
 			p.graph.setRoot(root)
 		}
+		// Restore the previous session's scope BEFORE computing the initial
+		// filters below, so gopls starts loading those packages during IWL
+		// rather than waiting for the first didOpen.  This eliminates the
+		// "module '.' not in workspace" orphan error the user would otherwise
+		// see during the type-check warmup window.
+		p.restoreScope(root)
 	}
 	opts, _ := params["initializationOptions"].(map[string]any)
 	if opts == nil {
