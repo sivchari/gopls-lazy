@@ -169,7 +169,7 @@ func (p *proxy) saveScope() {
 // Callers must NOT hold p.mu.
 func (p *proxy) restoreScope(root string) {
 	path := scopeCacheFile(root)
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // path is the scope cache file constructed from the workspace root
 	if err != nil {
 		return // first run or no saved scope
 	}

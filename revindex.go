@@ -233,7 +233,7 @@ func parseImports(src []byte, modPath string) (all, internal []string) {
 }
 
 func modulePath(gomod string) string {
-	data, err := os.ReadFile(gomod)
+	data, err := os.ReadFile(gomod) //nolint:gosec // gomod path is constructed by walking the workspace root
 	if err != nil {
 		return ""
 	}

@@ -57,7 +57,7 @@ func buildTestIndex(t *testing.T) *revIndex {
 		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+		if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -117,7 +117,7 @@ func TestUpdateFileChangeDetection(t *testing.T) {
 	if changed := ri.UpdateFile(path); changed {
 		t.Error("re-indexing an unchanged file should report no change")
 	}
-	if err := os.WriteFile(path, []byte("package c\n\nimport _ \"example.com/mod/go/pkg/base\"\n"), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte("package c\n\nimport _ \"example.com/mod/go/pkg/base\"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if changed := ri.UpdateFile(path); !changed {
