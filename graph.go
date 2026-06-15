@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -53,10 +54,51 @@ type savedGraph struct {
 	Dir         string   `json:"dir"`
 }
 
-// graphCacheFile returns the path for the on-disk cache given the workspace
-// root path.  Uses XDG_CACHE_HOME / darwin UserCacheDir if set, else ~/.cache.
+// graphCacheKey returns a stable identifier for the graph cache. All git
+// worktrees that share the same origin repository share the same key (via the
+// git common dir), so the on-disk cache is built once and reused across
+// worktrees instead of being rebuilt per worktree checkout.
+//
+// Resolution order:
+//  1. git common dir — stable across all worktrees of the same repo
+//  2. module path from go.mod — stable across branches (unless the module line changes)
+//  3. workspace root path — fallback when neither git nor go.mod is available
+func graphCacheKey(root string) string {
+	// git rev-parse --git-common-dir returns the path to the shared .git
+	// directory regardless of which worktree is currently checked out.
+	out, err := runGit(root, "rev-parse", "--git-common-dir")
+	if err == nil {
+		dir := strings.TrimSpace(string(out))
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(root, dir)
+		}
+		return dir
+	}
+	// Fallback: parse the module path from go.mod.
+	if b, err := os.ReadFile(filepath.Join(root, "go.mod")); err == nil {
+		for _, line := range strings.SplitN(string(b), "\n", 20) {
+			if mod, ok := strings.CutPrefix(line, "module "); ok {
+				if mod = strings.TrimSpace(mod); mod != "" {
+					return mod
+				}
+			}
+		}
+	}
+	// Last resort: use the workspace root path directly.
+	return root
+}
+
+func runGit(dir string, args ...string) ([]byte, error) {
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = os.Environ()
+	return cmd.Output()
+}
+
+// graphCacheFile returns the path for the on-disk cache for a given workspace
+// root. Uses XDG_CACHE_HOME / darwin UserCacheDir if set, else ~/.cache.
 func graphCacheFile(root string) string {
-	h := sha256.Sum256([]byte(root))
+	key := graphCacheKey(root)
+	h := sha256.Sum256([]byte(key))
 	base, err := os.UserCacheDir()
 	if err != nil {
 		base = filepath.Join(os.Getenv("HOME"), ".cache")
