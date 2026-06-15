@@ -26,7 +26,7 @@ func runDriver() int {
 	if err != nil {
 		return writeNotHandled()
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Minute))
 
 	wd, _ := os.Getwd()

@@ -9,6 +9,9 @@ import (
 	"time"
 )
 
+// filterExcludeAll is the directoryFilter pattern that excludes every package.
+const filterExcludeAll = "-**"
+
 // filtersLocked returns the directoryFilters for the current scope. The
 // caller must hold p.mu. During a temporary whole-workspace widening it
 // returns the editor's own filters (or the gopls default): the key must be
@@ -41,7 +44,7 @@ func (p *proxy) filtersLocked() []string {
 		}
 	}
 
-	fs := []string{"-**"}
+	fs := []string{filterExcludeAll}
 	for _, d := range dirs {
 		fs = append(fs, "+"+d)
 	}
@@ -156,7 +159,7 @@ func (p *proxy) saveScope() {
 		return
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 	}
 }
 

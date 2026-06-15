@@ -46,7 +46,7 @@ type options struct {
 // to gopls (editors like VS Code pass extra flags to the configured "gopls"
 // binary). Defaults can also come from GOPLS_LAZY_* environment variables,
 // for editor configs that cannot pass arguments.
-func parseArgs(args []string, getenv func(string) string) (options, error) {
+func parseArgs(args []string, getenv func(string) string) (options, error) { //nolint:gocognit // flag parser with many env vars and flags is inherently complex
 	o := options{
 		gopls:       "gopls",
 		granularity: 3,
@@ -172,7 +172,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "gopls-lazy: open log: %v\n", err)
 			os.Exit(1)
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 		logger.SetOutput(f)
 	}
 

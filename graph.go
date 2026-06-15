@@ -203,19 +203,19 @@ func (g *graphServer) saveDiskCache(resp []byte, patternsKey string, patterns []
 		return
 	}
 	if err := os.Rename(tmp, g.cacheFile); err != nil {
-		os.Remove(tmp)
+		_ = os.Remove(tmp)
 		return
 	}
 	g.log.Printf("driver: saved disk cache (%d bytes) to %s", len(b), g.cacheFile)
 }
 
 func (g *graphServer) handle(conn net.Conn) {
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	var q driverQuery
 	if err := json.NewDecoder(conn).Decode(&q); err != nil {
 		return
 	}
-	conn.Write(g.answer(q))
+	_, _ = conn.Write(g.answer(q))
 }
 
 var notHandled = []byte(`{"NotHandled":true}`)

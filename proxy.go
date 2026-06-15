@@ -307,7 +307,7 @@ func (p *proxy) captureUserFilters(settings map[string]any) {
 			fs = append(fs, s)
 		}
 	}
-	if len(fs) > 0 && fs[0] != "-**" { // ignore our own injected value
+	if len(fs) > 0 && fs[0] != filterExcludeAll { // ignore our own injected value
 		p.mu.Lock()
 		p.userFilters = fs
 		p.mu.Unlock()
@@ -551,9 +551,9 @@ func newFrameWriter(w io.Writer) *frameWriter {
 func (fw *frameWriter) write(body []byte) {
 	fw.mu.Lock()
 	defer fw.mu.Unlock()
-	fmt.Fprintf(fw.w, "Content-Length: %d\r\n\r\n", len(body))
-	fw.w.Write(body)
-	fw.w.Flush()
+	_, _ = fmt.Fprintf(fw.w, "Content-Length: %d\r\n\r\n", len(body))
+	_, _ = fw.w.Write(body)
+	_ = fw.w.Flush()
 }
 
 func readFrame(r *bufio.Reader) ([]byte, error) {
@@ -568,7 +568,7 @@ func readFrame(r *bufio.Reader) ([]byte, error) {
 			break
 		}
 		if k, v, ok := strings.Cut(line, ":"); ok && strings.EqualFold(strings.TrimSpace(k), "Content-Length") {
-			fmt.Sscanf(strings.TrimSpace(v), "%d", &length)
+			_, _ = fmt.Sscanf(strings.TrimSpace(v), "%d", &length)
 		}
 	}
 	if length <= 0 {
