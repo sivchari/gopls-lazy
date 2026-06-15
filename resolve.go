@@ -206,7 +206,7 @@ func parseDefinition(result json.RawMessage) *defLocation {
 // method: a func with a receiver, or a method inside an interface type.
 // Purely syntactic; no type information needed.
 func isMethodDecl(path string, line int) bool {
-	src, err := os.ReadFile(path)
+	src, err := os.ReadFile(path) //nolint:gosec // path is derived from a LSP location URI provided by gopls
 	if err != nil {
 		return false
 	}

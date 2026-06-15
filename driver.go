@@ -22,7 +22,7 @@ func runDriver() int {
 	if sock == "" {
 		return writeNotHandled()
 	}
-	conn, err := net.DialTimeout("unix", sock, 2*time.Second)
+	conn, err := net.DialTimeout("unix", sock, 2*time.Second) //nolint:gosec // sock path is set by the proxy itself via GOPLS_LAZY_SOCK
 	if err != nil {
 		return writeNotHandled()
 	}

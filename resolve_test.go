@@ -21,7 +21,7 @@ type I interface {
 `
 	dir := t.TempDir()
 	path := filepath.Join(dir, "x.go")
-	if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	tests := []struct {

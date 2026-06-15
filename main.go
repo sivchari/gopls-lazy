@@ -46,7 +46,7 @@ type options struct {
 // to gopls (editors like VS Code pass extra flags to the configured "gopls"
 // binary). Defaults can also come from GOPLS_LAZY_* environment variables,
 // for editor configs that cannot pass arguments.
-func parseArgs(args []string, getenv func(string) string) (options, error) { //nolint:gocognit // flag parser with many env vars and flags is inherently complex
+func parseArgs(args []string, getenv func(string) string) (options, error) { //nolint:gocognit,cyclop // flag parser with many env vars and flags is inherently complex
 	o := options{
 		gopls:       "gopls",
 		granularity: 3,
@@ -143,7 +143,7 @@ func parseArgs(args []string, getenv func(string) string) (options, error) { //n
 }
 
 func cutFlagValue(arg string) (name, value string, ok bool) {
-	if len(arg) == 0 || arg[0] != '-' {
+	if arg == "" || arg[0] != '-' {
 		return arg, "", false
 	}
 	for i := 1; i < len(arg); i++ {
@@ -155,22 +155,28 @@ func cutFlagValue(arg string) (name, value string, ok bool) {
 }
 
 func main() {
+	os.Exit(realMain())
+}
+
+// realMain contains the real entry-point logic so that deferred cleanup
+// (e.g. closing the log file) runs before os.Exit terminates the process.
+func realMain() int {
 	if os.Getenv("GOPLS_LAZY_DRIVER") == "1" && os.Getenv("GOPLS_LAZY_SOCK") != "" {
-		os.Exit(runDriver())
+		return runDriver()
 	}
 
 	opts, err := parseArgs(os.Args[1:], os.Getenv)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "gopls-lazy: %v\n", err)
-		os.Exit(2)
+		return 2
 	}
 
 	logger := log.New(io.Discard, "", log.LstdFlags|log.Lmicroseconds)
 	if opts.logPath != "" {
-		f, err := os.OpenFile(opts.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+		f, err := os.OpenFile(opts.logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gopls-lazy: open log: %v\n", err)
-			os.Exit(1)
+			return 1
 		}
 		defer func() { _ = f.Close() }()
 		logger.SetOutput(f)
@@ -185,5 +191,5 @@ func main() {
 		idx:         newRevIndex(logger),
 		log:         logger,
 	}
-	os.Exit(p.run())
+	return p.run()
 }

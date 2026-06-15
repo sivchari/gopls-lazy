@@ -75,7 +75,7 @@ func graphCacheKey(root string) string {
 		return dir
 	}
 	// Fallback: parse the module path from go.mod.
-	if b, err := os.ReadFile(filepath.Join(root, "go.mod")); err == nil {
+	if b, err := os.ReadFile(filepath.Join(root, "go.mod")); err == nil { //nolint:gosec // reading go.mod from workspace root is intentional
 		for _, line := range strings.SplitN(string(b), "\n", 20) {
 			if mod, ok := strings.CutPrefix(line, "module "); ok {
 				if mod = strings.TrimSpace(mod); mod != "" {
@@ -89,7 +89,7 @@ func graphCacheKey(root string) string {
 }
 
 func runGit(dir string, args ...string) ([]byte, error) {
-	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...) //nolint:gosec // dir is the workspace root provided by the editor
 	cmd.Env = os.Environ()
 	return cmd.Output()
 }
@@ -195,11 +195,11 @@ func (g *graphServer) saveDiskCache(resp []byte, patternsKey string, patterns []
 	if err != nil {
 		return
 	}
-	if err := os.MkdirAll(filepath.Dir(g.cacheFile), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(g.cacheFile), 0o750); err != nil {
 		return
 	}
 	tmp := g.cacheFile + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
 		return
 	}
 	if err := os.Rename(tmp, g.cacheFile); err != nil {

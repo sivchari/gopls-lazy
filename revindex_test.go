@@ -54,7 +54,7 @@ func buildTestIndex(t *testing.T) *revIndex {
 	root := t.TempDir()
 	write := func(rel, src string) {
 		path := filepath.Join(root, rel)
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(path, []byte(src), 0o644); err != nil {
@@ -94,7 +94,7 @@ func TestClosureUnits(t *testing.T) {
 
 func TestSameImports(t *testing.T) {
 	ri := buildTestIndex(t)
-	path := filepath.Join(ri.root, "go/services/b/main.go")
+	path := filepath.Join(ri.root, "go", "services", "b", "main.go")
 
 	same := []byte("package b\n\nimport _ \"example.com/mod/go/pkg/mid\"\n\nfunc edited() {}\n")
 	if !ri.SameImports(path, same) {
@@ -112,7 +112,7 @@ func TestSameImports(t *testing.T) {
 
 func TestUpdateFileChangeDetection(t *testing.T) {
 	ri := buildTestIndex(t)
-	path := filepath.Join(ri.root, "go/services/c/main.go")
+	path := filepath.Join(ri.root, "go", "services", "c", "main.go")
 
 	if changed := ri.UpdateFile(path); changed {
 		t.Error("re-indexing an unchanged file should report no change")

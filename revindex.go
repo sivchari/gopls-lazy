@@ -69,7 +69,7 @@ func (ri *revIndex) Build(root string) {
 	var files []string
 	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil
+			return nil //nolint:nilerr // swallow WalkDir entry errors to continue indexing
 		}
 		if d.IsDir() {
 			name := d.Name()
@@ -121,7 +121,7 @@ func (ri *revIndex) UpdateFile(path string) bool {
 	}
 	rel = filepath.ToSlash(rel)
 
-	src, err := os.ReadFile(path)
+	src, err := os.ReadFile(path) //nolint:gosec // path is validated to be inside the workspace root via filepath.Rel
 	if err != nil {
 		// Deleted: keep edges (additive index), report a change so the
 		// package-graph cache refreshes.

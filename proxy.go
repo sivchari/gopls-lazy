@@ -58,7 +58,7 @@ type proxy struct {
 
 func (p *proxy) run() int {
 	args := p.opts.goplsArgs
-	cmd := exec.Command(p.opts.gopls, args...)
+	cmd := exec.Command(p.opts.gopls, args...) //nolint:gosec // gopls path comes from user configuration, not untrusted input
 	cmd.Env = os.Environ()
 	if p.opts.driver {
 		g, err := startGraphServer(p.idx, p.log)
