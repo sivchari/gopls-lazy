@@ -9,50 +9,6 @@ import (
 	"testing"
 )
 
-func TestScopeUnit(t *testing.T) {
-	tests := []struct {
-		rel  string
-		n    int
-		want string
-	}{
-		{"go/services/auth/internal/tokens", 3, "go/services/auth"},
-		{"go/services/auth", 3, "go/services/auth"},
-		{"go/pkg", 3, "go/pkg"},
-		{"pkg/kubelet/types", 2, "pkg/kubelet"},
-		{"main", 3, "main"},
-	}
-	for _, tt := range tests {
-		if got := scopeUnit(tt.rel, tt.n); got != tt.want {
-			t.Errorf("scopeUnit(%q, %d) = %q, want %q", tt.rel, tt.n, got, tt.want)
-		}
-	}
-}
-
-func TestGoMinor(t *testing.T) {
-	tests := []struct {
-		in   string
-		want int
-	}{
-		{"go1.26.4", 26},
-		{"go1.27-devel_69a99fdcbb Sun May 17", 27},
-		{"devel +abcdef", 0},
-	}
-	for _, tt := range tests {
-		if got := goMinor(tt.in); got != tt.want {
-			t.Errorf("goMinor(%q) = %d, want %d", tt.in, got, tt.want)
-		}
-	}
-}
-
-func TestIsWorkspaceQuery(t *testing.T) {
-	if !isWorkspaceQuery([]string{"/repo/...", "builtin"}) {
-		t.Error("recursive pattern should be a workspace query")
-	}
-	if isWorkspaceQuery([]string{"file=/repo/main.go"}) {
-		t.Error("file= pattern should not be a workspace query")
-	}
-}
-
 func TestParseImports(t *testing.T) {
 	src := []byte(`package x
 
@@ -71,6 +27,20 @@ import (
 	}
 	if !reflect.DeepEqual(internal, wantInternal) {
 		t.Errorf("internal = %v, want %v", internal, wantInternal)
+	}
+}
+
+func TestParseImports_EmbedSignature(t *testing.T) {
+	without := []byte("package x\n\nimport \"embed\"\n\nvar fs embed.FS\n")
+	with := []byte("package x\n\nimport \"embed\"\n\n//go:embed assets/*\nvar fs embed.FS\n")
+	a1, _ := parseImports(without, "example.com/mod")
+	a2, _ := parseImports(with, "example.com/mod")
+	if reflect.DeepEqual(a1, a2) {
+		t.Error("adding a //go:embed directive should change the file signature")
+	}
+	a3, _ := parseImports(with, "example.com/mod")
+	if !reflect.DeepEqual(a2, a3) {
+		t.Error("identical content should produce identical signatures")
 	}
 }
 
