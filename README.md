@@ -1,10 +1,10 @@
-# gopls-fleet
+# gopls-lazy
 
 A local-only LSP proxy that makes gopls usable in large Go monorepos.
 
 gopls type-checks every workspace package in the background after startup.
 In a single-module monorepo with ~24k Go files this costs minutes of CPU and
->10GB of RSS per editor session. gopls-fleet sits between your editor and
+>10GB of RSS per editor session. gopls-lazy sits between your editor and
 gopls and keeps the workspace scoped to what you are actually editing.
 No server, no shared cache, no infrastructure.
 
@@ -30,7 +30,7 @@ No server, no shared cache, no infrastructure.
 ## Usage
 
 ```
-gopls-fleet [flags]
+gopls-lazy [flags]
 
   -gopls path        gopls binary (default: "gopls" from PATH)
   -granularity n     path segments per scope unit (default 3:
@@ -44,16 +44,16 @@ gopls-fleet [flags]
 
 Unrecognized flags are forwarded to gopls, so the proxy is a drop-in
 replacement for the gopls binary. Every flag can also be set via environment
-variables (`GOPLS_FLEET_GOPLS`, `GOPLS_FLEET_GRANULARITY`,
-`GOPLS_FLEET_DEBOUNCE`, `GOPLS_FLEET_EVICT`, `GOPLS_FLEET_DRIVER=false`,
-`GOPLS_FLEET_LOG`) for editors that cannot pass arguments.
+variables (`GOPLS_LAZY_GOPLS`, `GOPLS_LAZY_GRANULARITY`,
+`GOPLS_LAZY_DEBOUNCE`, `GOPLS_LAZY_EVICT`, `GOPLS_LAZY_DRIVER=false`,
+`GOPLS_LAZY_LOG`) for editors that cannot pass arguments.
 
 ### VS Code
 
 ```jsonc
 // settings.json
 {
-  "go.alternateTools": { "gopls": "/path/to/gopls-fleet" }
+  "go.alternateTools": { "gopls": "/path/to/gopls-lazy" }
 }
 ```
 
@@ -61,7 +61,7 @@ variables (`GOPLS_FLEET_GOPLS`, `GOPLS_FLEET_GRANULARITY`,
 
 ```lua
 require("lspconfig").gopls.setup({
-  cmd = { "gopls-fleet" },
+  cmd = { "gopls-lazy" },
 })
 ```
 
@@ -70,7 +70,7 @@ Other gopls settings pass through untouched (the proxy patches
 
 ## Measured on a production monorepo (24k Go files, single go.mod, cold cache)
 
-| metric | plain gopls | gopls-fleet |
+| metric | plain gopls | gopls-lazy |
 |---|---|---|
 | background type-check CPU | 205.8s | 101.2s |
 | RSS while editing one service | 13.1GB | 3.7GB |
