@@ -228,27 +228,47 @@ func (g *graphServer) answer(q driverQuery) []byte {
 	key := strings.Join(q.Patterns, "\x00")
 
 	g.mu.Lock()
-	if g.resp != nil && !g.stale && key == g.patternsKey {
-		resp := g.resp
-		g.mu.Unlock()
-		if g.overlayDirty(req.Overlay) {
-			g.log.Printf("driver: overlay changes imports, falling back to go list")
-			return notHandled
+	resp := g.resp
+	stale := g.stale
+	hasCache := resp != nil && key == g.patternsKey
+
+	if !hasCache {
+		// No cache at all: trigger a background build for workspace queries
+		// and tell gopls to fall back to the real go list.
+		if isWorkspaceQuery(q.Patterns) && !g.building {
+			g.building = true
+			patterns := append([]string(nil), q.Patterns...)
+			dir := q.Dir
+			go g.build(patterns, dir, key)
 		}
-		g.log.Printf("driver: served %d patterns from cache (%d bytes)", len(q.Patterns), len(resp))
-		return resp
+		g.mu.Unlock()
+		g.log.Printf("driver: NotHandled (no cache, patterns=%v)", q.Patterns)
+		return notHandled
 	}
-	// Cache miss. If this is a full workspace query, learn its exact
-	// patterns and build the cache in the background for next time.
-	if isWorkspaceQuery(q.Patterns) && !g.building {
+
+	// We have a cache. If it is stale (go.mod / imports changed on disk),
+	// kick off a background rebuild but still serve the cached data so
+	// re-scopes during the ~13s rebuild window don't regress to full go list.
+	if stale && !g.building {
 		g.building = true
-		patterns := append([]string(nil), q.Patterns...)
-		dir := q.Dir
+		patterns, dir := g.patterns, g.dir
 		go g.build(patterns, dir, key)
 	}
 	g.mu.Unlock()
-	g.log.Printf("driver: NotHandled (patterns=%v stale=%v)", q.Patterns, g.stale)
-	return notHandled
+
+	// Only fall back for live import changes the user has in an unsaved
+	// overlay — those modify the package graph in a way the cached snapshot
+	// cannot reflect.
+	if g.overlayDirty(req.Overlay) {
+		g.log.Printf("driver: overlay changes imports, falling back to go list")
+		return notHandled
+	}
+	if stale {
+		g.log.Printf("driver: served %d patterns from stale cache (%d bytes, rebuild in progress)", len(q.Patterns), len(resp))
+	} else {
+		g.log.Printf("driver: served %d patterns from cache (%d bytes)", len(q.Patterns), len(resp))
+	}
+	return resp
 }
 
 // isWorkspaceQuery reports whether the patterns look like gopls's initial
