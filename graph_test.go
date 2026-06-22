@@ -82,6 +82,46 @@ func TestGraphFresh(t *testing.T) {
 	}
 }
 
+func TestGraphFresh_GoWorkSubmodule(t *testing.T) {
+	dir := t.TempDir()
+	cache := filepath.Join(dir, "graph.json")
+	write := func(p, content string) {
+		t.Helper()
+		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	chtime := func(p string, mod time.Time) {
+		t.Helper()
+		if err := os.Chtimes(p, mod, mod); err != nil {
+			t.Fatal(err)
+		}
+	}
+	subMod := filepath.Join(dir, "svc", "go.mod")
+	write(filepath.Join(dir, "go.work"), "go 1.22\n\nuse (\n\t./svc\n)\n")
+	write(filepath.Join(dir, "go.mod"), "module root\n")
+	write(subMod, "module root/svc\n")
+	write(cache, "{}")
+
+	old := time.Now().Add(-time.Hour)
+	for _, p := range []string{filepath.Join(dir, "go.work"), filepath.Join(dir, "go.mod"), subMod} {
+		chtime(p, old)
+	}
+	// All module files older than cache -> fresh.
+	if !graphFresh(cache, dir) {
+		t.Error("all module files older than cache should be fresh")
+	}
+	// Editing only the sub-module's go.mod (root files untouched) must make the
+	// cache stale -- the regression this go.work support fixes.
+	chtime(subMod, time.Now().Add(time.Hour))
+	if graphFresh(cache, dir) {
+		t.Error("a newer go.work sub-module go.mod should make the cache stale")
+	}
+}
+
 func TestEmbedLiteralRoot(t *testing.T) {
 	const dir = "/repo/x"
 	tests := []struct {

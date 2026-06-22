@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -170,11 +171,10 @@ const (
 )
 
 // graphFresh reports whether the on-disk graph cache's dependency set is still
-// current: true when no module-structural input (go.mod/go.sum/go.work/
-// go.work.sum) under root is at-or-newer than the cache file. It only decides
-// how urgently to revalidate, not whether to: a fresh result merely defers the
-// refresh longer. An equal mtime counts as not-fresh, so an edit racing the
-// cache write is never missed.
+// current: true when no module-structural input is at-or-newer than the cache
+// file. It only decides how urgently to revalidate, not whether to: a fresh
+// result merely defers the refresh longer. An equal mtime counts as not-fresh,
+// so an edit racing the cache write is never missed.
 func graphFresh(cacheFile, root string) bool {
 	if root == "" {
 		return false
@@ -184,12 +184,44 @@ func graphFresh(cacheFile, root string) bool {
 		return false
 	}
 	cacheT := fi.ModTime()
-	for _, name := range []string{"go.mod", "go.sum", "go.work", "go.work.sum"} {
-		if s, err := os.Stat(filepath.Join(root, name)); err == nil && !s.ModTime().Before(cacheT) {
+	for _, f := range moduleFiles(root) {
+		if s, err := os.Stat(f); err == nil && !s.ModTime().Before(cacheT) {
 			return false
 		}
 	}
 	return true
+}
+
+// moduleFiles lists the module-structural files whose modification implies the
+// dependency graph may have changed: the root go.mod/go.sum/go.work/go.work.sum,
+// plus the go.mod/go.sum of every module a go.work `use` directive points to.
+// Without this, editing a sub-module's go.mod in a multi-module workspace would
+// not touch the root files and the cache would be wrongly considered fresh.
+// A missing or malformed go.work falls back to the root files only.
+func moduleFiles(root string) []string {
+	files := []string{
+		filepath.Join(root, "go.mod"),
+		filepath.Join(root, "go.sum"),
+		filepath.Join(root, "go.work"),
+		filepath.Join(root, "go.work.sum"),
+	}
+	workPath := filepath.Join(root, "go.work")
+	data, err := os.ReadFile(workPath) //nolint:gosec // workPath is built from the workspace root
+	if err != nil {
+		return files // no go.work (the common case) or unreadable
+	}
+	wf, err := modfile.ParseWork(workPath, data, nil)
+	if err != nil {
+		return files // malformed: be conservative, root files only
+	}
+	for _, u := range wf.Use {
+		dir := u.Path
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(root, dir)
+		}
+		files = append(files, filepath.Join(dir, "go.mod"), filepath.Join(dir, "go.sum"))
+	}
+	return files
 }
 
 // loadDiskCache reads the on-disk graph and begins a background rebuild to

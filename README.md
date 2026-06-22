@@ -45,15 +45,19 @@ gopls-lazy [flags]
   -debounce dur      coalesce window for scope changes (default 500ms)
   -evict dur         drop units with no open files after this idle time
                      (default 10m; 0 disables)
-  -driver=bool       GOPACKAGESDRIVER graph cache (default true)
   -log path          debug log
 ```
 
 Unrecognized flags are forwarded to gopls, so the proxy is a drop-in
 replacement for the gopls binary. Every flag can also be set via environment
 variables (`GOPLS_LAZY_GOPLS`, `GOPLS_LAZY_GRANULARITY`,
-`GOPLS_LAZY_DEBOUNCE`, `GOPLS_LAZY_EVICT`, `GOPLS_LAZY_DRIVER=false`,
-`GOPLS_LAZY_LOG`) for editors that cannot pass arguments.
+`GOPLS_LAZY_DEBOUNCE`, `GOPLS_LAZY_EVICT`, `GOPLS_LAZY_LOG`) for editors that
+cannot pass arguments.
+
+The GOPACKAGESDRIVER graph cache is on by default and falls back to the real
+`go list` automatically when it cannot help, so it rarely needs touching. It
+can be disabled for troubleshooting with `GOPLS_LAZY_DRIVER=false` (or
+`-driver=false`).
 
 ### VS Code
 
