@@ -1,9 +1,8 @@
-package main
+package goplslazy
 
 import (
 	"reflect"
 	"testing"
-	"time"
 )
 
 func TestScopeUnit(t *testing.T) {
@@ -25,7 +24,7 @@ func TestScopeUnit(t *testing.T) {
 	}
 }
 
-func TestFiltersLocked_FullWorkspace(t *testing.T) {
+func TestFiltersLocked_RootUnit(t *testing.T) {
 	p := &proxy{scope: map[string]*scopeEntry{
 		"go/services/auth": {open: map[string]bool{}},
 	}}
@@ -34,15 +33,12 @@ func TestFiltersLocked_FullWorkspace(t *testing.T) {
 		t.Errorf("scoped filters = %v", got)
 	}
 
-	// During a whole-workspace widening the key must be SET to an explicit
-	// value (gopls layers configuration over initializationOptions; an
-	// absent key would keep the old filters and skip the view reload).
-	p.fullUntil = time.Now().Add(time.Minute)
-	if got := p.filtersLocked(); !reflect.DeepEqual(got, []string{"-**/node_modules"}) {
-		t.Errorf("full-workspace filters = %v, want gopls default", got)
+	p.scope["."] = &scopeEntry{open: map[string]bool{}}
+	if got := p.filtersLocked(); !reflect.DeepEqual(got, []string{}) {
+		t.Errorf("root-unit filters = %v, want no filters", got)
 	}
 	p.userFilters = []string{"-**/testdata"}
 	if got := p.filtersLocked(); !reflect.DeepEqual(got, []string{"-**/testdata"}) {
-		t.Errorf("full-workspace filters = %v, want user filters", got)
+		t.Errorf("root-unit filters = %v, want user filters", got)
 	}
 }

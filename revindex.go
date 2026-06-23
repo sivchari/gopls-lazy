@@ -1,4 +1,4 @@
-package main
+package goplslazy
 
 import (
 	"go/parser"
@@ -24,6 +24,7 @@ type revIndex struct {
 	root        string
 	modPath     string
 	fileImports map[string][]string        // rel file -> imported rel pkg dirs (internal only)
+	fileSymbols map[string][]indexedSymbol // rel file -> top-level symbols in that file
 	importers   map[string]map[string]bool // rel pkg dir -> set of rel dirs importing it
 	readyCh     chan struct{}
 	readyOnce   sync.Once
@@ -33,6 +34,7 @@ type revIndex struct {
 func newRevIndex(logger *log.Logger) *revIndex {
 	return &revIndex{
 		fileImports: map[string][]string{},
+		fileSymbols: map[string][]indexedSymbol{},
 		importers:   map[string]map[string]bool{},
 		readyCh:     make(chan struct{}),
 		log:         logger,
@@ -123,11 +125,14 @@ func (ri *revIndex) UpdateFile(path string) bool {
 
 	src, err := os.ReadFile(path) //nolint:gosec // path is validated to be inside the workspace root via filepath.Rel
 	if err != nil {
-		// Deleted: keep edges (additive index), report a change so the
-		// package-graph cache refreshes.
+		// Deleted: keep import edges (additive index), but drop symbols from
+		// this file so workspace/symbol does not report stale definitions.
+		ri.mu.Lock()
+		delete(ri.fileSymbols, rel)
+		ri.mu.Unlock()
 		return true
 	}
-	all, internal := parseImports(src, modPath)
+	all, internal, symbols := parseFileMetadata(src, modPath, rel)
 	dir := filepath.ToSlash(filepath.Dir(rel))
 
 	ri.mu.Lock()
@@ -135,6 +140,7 @@ func (ri *revIndex) UpdateFile(path string) bool {
 	old := ri.fileImports[rel]
 	changed := !equalStrings(old, all)
 	ri.fileImports[rel] = all
+	ri.fileSymbols[rel] = symbols
 	for _, imp := range internal {
 		set := ri.importers[imp]
 		if set == nil {
@@ -230,6 +236,39 @@ func parseImports(src []byte, modPath string) (all, internal []string) {
 	sort.Strings(all)
 	sort.Strings(internal)
 	return all, internal
+}
+
+func parseFileMetadata(src []byte, modPath, rel string) (all, internal []string, symbols []indexedSymbol) {
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, rel, src, parser.SkipObjectResolution)
+	if err != nil && f == nil {
+		return nil, nil, nil
+	}
+	for _, imp := range f.Imports {
+		p, err := strconv.Unquote(imp.Path.Value)
+		if err != nil {
+			continue
+		}
+		all = append(all, p)
+		if modPath == "" {
+			continue
+		}
+		if p == modPath {
+			internal = append(internal, ".")
+		} else if strings.HasPrefix(p, modPath+"/") {
+			internal = append(internal, p[len(modPath)+1:])
+		}
+	}
+	for line := range strings.Lines(string(src)) {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "//go:embed") {
+			all = append(all, "\x00embed:"+t)
+		}
+	}
+	symbols = collectSymbols(fset, f, rel)
+	sort.Strings(all)
+	sort.Strings(internal)
+	return all, internal, symbols
 }
 
 func modulePath(gomod string) string {

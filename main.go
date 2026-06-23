@@ -1,6 +1,6 @@
-// gopls-lazy is an LSP stdio proxy that sits between an editor and gopls
-// and dynamically narrows the gopls workspace to the directories the user is
-// actually editing, via directoryFilters.
+// Package goplslazy implements an LSP stdio proxy that sits between an editor
+// and gopls and dynamically narrows the gopls workspace to the directories the
+// user is actually editing, via directoryFilters.
 //
 // In large single-module monorepos gopls type-checks every workspace package
 // in the background after startup. The proxy starts gopls with everything
@@ -12,16 +12,17 @@
 //
 //   - Opened files first get orphan-mode diagnostics from gopls, and the
 //     workspace is re-scoped right after, so feedback stays fast.
-//   - rename/references/implementation requests are resolved to their
-//     defining package and held while the scope is expanded with its
-//     reverse-import closure (or the whole workspace for method symbols,
-//     which can be referenced through interfaces from anywhere), so results
-//     are not silently truncated.
+//   - rename/references requests are resolved to their defining package and
+//     held while the scope is expanded with its reverse-import closure, so
+//     results are not silently truncated.
+//   - implementation requests and method-wide references run in an isolated
+//     worker gopls process, so the long-lived interactive gopls is never
+//     widened to the whole workspace.
 //   - Scope units with no open files are evicted after a TTL.
 //   - The same binary acts as a GOPACKAGESDRIVER (when gopls invokes it) and
 //     serves the package graph from an in-proxy cache, eliminating repeated
 //     `go list ./...` runs on every re-scope.
-package main
+package goplslazy
 
 import (
 	"fmt"
@@ -154,13 +155,10 @@ func cutFlagValue(arg string) (name, value string, ok bool) {
 	return arg, "", false
 }
 
-func main() {
-	os.Exit(realMain())
-}
-
-// realMain contains the real entry-point logic so that deferred cleanup
-// (e.g. closing the log file) runs before os.Exit terminates the process.
-func realMain() int {
+// Run is the entry point for the gopls-lazy proxy. It returns a process exit
+// code; the caller passes it to os.Exit so that deferred cleanup (e.g. closing
+// the log file) runs before the process terminates.
+func Run() int {
 	if os.Getenv("GOPLS_LAZY_DRIVER") == "1" && os.Getenv("GOPLS_LAZY_SOCK") != "" {
 		return runDriver()
 	}
@@ -186,6 +184,7 @@ func realMain() int {
 		opts:        opts,
 		scope:       map[string]*scopeEntry{},
 		configIDs:   map[string]bool{},
+		openDocs:    map[string]openDoc{},
 		pendingDiag: map[string]bool{},
 		pendingOwn:  map[string]chan *message{},
 		idx:         newRevIndex(logger),
