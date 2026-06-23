@@ -1,5 +1,10 @@
 # Changelog
 
+## [v0.2.0](https://github.com/sivchari/gopls-lazy/compare/v0.1.1...v0.2.0) - 2026-06-23
+- perf: skip competing graph rebuilds for fast warm startup by @sivchari in https://github.com/sivchari/gopls-lazy/pull/5
+- feat: isolate cross-reference requests in a worker and serve workspace symbols in-proxy by @sivchari in https://github.com/sivchari/gopls-lazy/pull/6
+- release v0.2.0 by @sivchari in https://github.com/sivchari/gopls-lazy/pull/8
+
 ## [v0.1.1](https://github.com/sivchari/gopls-lazy/compare/v0.1.0...v0.1.1) - 2026-06-18
 - chore: add MIT LICENSE file by @sivchari in https://github.com/sivchari/gopls-lazy/pull/3
 
