@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/mod/modfile"
 	"golang.org/x/tools/go/packages"
 )
 
@@ -28,7 +29,9 @@ import (
 // $XDG_CACHE_HOME/gopls-lazy/graph-<root-hash>.json. On the next startup
 // the cached graph is loaded immediately so the first workspace query is
 // served from disk (µs) rather than from a fresh `go list ./...` (13+ s).
-// A background rebuild starts in parallel to validate / refresh the cache.
+// The revalidating rebuild always runs but is deferred past the initial burst
+// of file opens (sooner when a module file changed, later when nothing did),
+// so it never competes with type-checking during startup.
 type graphServer struct {
 	idx       *revIndex
 	log       *log.Logger
@@ -37,6 +40,7 @@ type graphServer struct {
 	ln        net.Listener
 
 	mu           sync.Mutex
+	root         string // workspace root, for the startup freshness check
 	resp         []byte // cached marshaled DriverResponse
 	patternsKey  string
 	patterns     []string
@@ -44,6 +48,12 @@ type graphServer struct {
 	building     bool
 	stale        bool
 	rebuildTimer *time.Timer
+
+	// //go:embed footprint, so a non-Go file change invalidates the graph only
+	// when it can actually affect it (rather than on every build artifact).
+	embedReady    bool
+	embedFiles    map[string]bool // absolute paths of currently embedded files
+	embedPrefixes []string        // slash literal roots of embed patterns (new files)
 }
 
 // savedGraph is the on-disk format for the graph cache.
@@ -144,8 +154,74 @@ func (g *graphServer) setRoot(root string) {
 		return // already set
 	}
 	g.cacheFile = graphCacheFile(root)
+	g.root = root
 	g.mu.Unlock()
 	g.loadDiskCache()
+}
+
+// Startup revalidation delays. The on-disk graph is always served immediately;
+// the `go list ./...` refresh is deferred past the initial burst of file opens
+// so it never competes with type-checking. When a module file changed the
+// refresh runs sooner to pick up the new dependency graph; otherwise it is only
+// a low-priority safety net that catches source/package changes made between
+// sessions (e.g. a git pull while the editor was closed).
+const (
+	staleRevalidateDelay = 15 * time.Second
+	freshRevalidateDelay = 120 * time.Second
+)
+
+// graphFresh reports whether the on-disk graph cache's dependency set is still
+// current: true when no module-structural input is at-or-newer than the cache
+// file. It only decides how urgently to revalidate, not whether to: a fresh
+// result merely defers the refresh longer. An equal mtime counts as not-fresh,
+// so an edit racing the cache write is never missed.
+func graphFresh(cacheFile, root string) bool {
+	if root == "" {
+		return false
+	}
+	fi, err := os.Stat(cacheFile)
+	if err != nil {
+		return false
+	}
+	cacheT := fi.ModTime()
+	for _, f := range moduleFiles(root) {
+		if s, err := os.Stat(f); err == nil && !s.ModTime().Before(cacheT) {
+			return false
+		}
+	}
+	return true
+}
+
+// moduleFiles lists the module-structural files whose modification implies the
+// dependency graph may have changed: the root go.mod/go.sum/go.work/go.work.sum,
+// plus the go.mod/go.sum of every module a go.work `use` directive points to.
+// Without this, editing a sub-module's go.mod in a multi-module workspace would
+// not touch the root files and the cache would be wrongly considered fresh.
+// A missing or malformed go.work falls back to the root files only.
+func moduleFiles(root string) []string {
+	files := []string{
+		filepath.Join(root, "go.mod"),
+		filepath.Join(root, "go.sum"),
+		filepath.Join(root, "go.work"),
+		filepath.Join(root, "go.work.sum"),
+	}
+	workPath := filepath.Join(root, "go.work")
+	data, err := os.ReadFile(workPath) //nolint:gosec // workPath is built from the workspace root
+	if err != nil {
+		return files // no go.work (the common case) or unreadable
+	}
+	wf, err := modfile.ParseWork(workPath, data, nil)
+	if err != nil {
+		return files // malformed: be conservative, root files only
+	}
+	for _, u := range wf.Use {
+		dir := u.Path
+		if !filepath.IsAbs(dir) {
+			dir = filepath.Join(root, dir)
+		}
+		files = append(files, filepath.Join(dir, "go.mod"), filepath.Join(dir, "go.sum"))
+	}
+	return files
 }
 
 // loadDiskCache reads the on-disk graph and begins a background rebuild to
@@ -172,11 +248,143 @@ func (g *graphServer) loadDiskCache() {
 	g.patterns = saved.Patterns
 	g.dir = saved.Dir
 	g.stale = false
-	g.building = true // prevent answer() from spawning a duplicate rebuild
+	root := g.root
 	g.mu.Unlock()
-	g.log.Printf("driver: loaded disk cache (%d bytes) from %s; refreshing in background", len(saved.Resp), g.cacheFile)
-	// Rebuild in background to pick up any changes since the cache was written.
-	go g.build(saved.Patterns, saved.Dir, saved.PatternsKey)
+	// Decode the embed footprint off the critical path: the first workspace
+	// query only needs g.resp, which is already published above.
+	go g.setEmbedFromResp(saved.Resp)
+	g.log.Printf("driver: loaded disk cache (%d bytes) from %s", len(saved.Resp), g.cacheFile)
+
+	// Serve the cached graph immediately and revalidate in the background, but
+	// DEFER the rebuild past the initial burst of file opens so the ~12s
+	// `go list ./...` never competes with type-checking. graphFresh only picks
+	// how long to wait; the refresh always runs, so source/package changes made
+	// between sessions are still picked up.
+	delay := staleRevalidateDelay
+	if graphFresh(g.cacheFile, root) {
+		delay = freshRevalidateDelay
+	}
+	g.log.Printf("driver: disk cache served; background revalidation in %s", delay)
+	patterns, dir, key := saved.Patterns, saved.Dir, saved.PatternsKey
+	time.AfterFunc(delay, func() {
+		g.mu.Lock()
+		if g.building {
+			g.mu.Unlock()
+			return // a MarkStale-triggered rebuild already covered it
+		}
+		g.building = true
+		g.mu.Unlock()
+		g.build(patterns, dir, key)
+	})
+}
+
+// setEmbedFromResp records the //go:embed footprint from a marshaled
+// DriverResponse. Used on the disk-cache load path, where the packages are only
+// available as JSON.
+func (g *graphServer) setEmbedFromResp(resp []byte) {
+	var r struct {
+		Packages []struct {
+			GoFiles       []string
+			EmbedFiles    []string
+			EmbedPatterns []string
+		}
+	}
+	if json.Unmarshal(resp, &r) != nil {
+		return
+	}
+	files := make(map[string]bool)
+	prefixSet := make(map[string]bool)
+	for _, p := range r.Packages {
+		addEmbed(files, prefixSet, p.GoFiles, p.EmbedFiles, p.EmbedPatterns)
+	}
+	g.storeEmbed(files, prefixSet)
+}
+
+// setEmbedFromPackages records the same footprint directly from the loaded
+// packages, so a fresh build does not re-decode the multi-MB response it just
+// produced.
+func (g *graphServer) setEmbedFromPackages(pkgs []*packages.Package) {
+	files := make(map[string]bool)
+	prefixSet := make(map[string]bool)
+	for _, p := range pkgs {
+		addEmbed(files, prefixSet, p.GoFiles, p.EmbedFiles, p.EmbedPatterns)
+	}
+	g.storeEmbed(files, prefixSet)
+}
+
+// addEmbed folds one package's embed footprint into the accumulating sets: the
+// exact embedded files (slash-normalized) plus the literal root of every embed
+// pattern, so a newly added file matching an existing pattern is still caught
+// without invalidating the package's whole directory tree.
+func addEmbed(files, prefixSet map[string]bool, goFiles, embedFiles, embedPatterns []string) {
+	for _, f := range embedFiles {
+		files[filepath.ToSlash(f)] = true
+	}
+	if len(embedPatterns) == 0 || len(goFiles) == 0 {
+		return
+	}
+	dir := filepath.ToSlash(filepath.Dir(goFiles[0]))
+	for _, pat := range embedPatterns {
+		if root := embedLiteralRoot(pat, dir); root != "" {
+			prefixSet[root] = true
+		}
+	}
+}
+
+func (g *graphServer) storeEmbed(files, prefixSet map[string]bool) {
+	prefixes := make([]string, 0, len(prefixSet))
+	for p := range prefixSet {
+		prefixes = append(prefixes, p)
+	}
+	g.mu.Lock()
+	g.embedFiles = files
+	g.embedPrefixes = prefixes
+	g.embedReady = true
+	g.mu.Unlock()
+}
+
+// embedLiteralRoot returns the fixed (wildcard-free) leading path of an embed
+// pattern, resolved to an absolute slash path against the package dir. A change
+// at or under this root may add a file the pattern matches; anything outside it
+// cannot. E.g. "tmpl/*.html" -> "<dir>/tmpl", "config.yml" -> "<dir>/config.yml".
+// Returns "" when the pattern's first segment is itself a wildcard (the root
+// would be the package dir, handled by the exact-file set instead).
+func embedLiteralRoot(pattern, dir string) string {
+	p := strings.TrimPrefix(pattern, "all:")
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(dir, p)
+	}
+	p = filepath.ToSlash(p)
+	if i := strings.IndexAny(p, "*?["); i >= 0 {
+		s := strings.LastIndex(p[:i], "/")
+		if s < 0 {
+			return ""
+		}
+		p = p[:s]
+	}
+	return strings.TrimRight(p, "/")
+}
+
+// IsEmbedFile reports whether a non-Go path can affect the package graph as an
+// //go:embed asset: it is a currently embedded file, or it sits at/under the
+// literal root of some embed pattern. Until the footprint is known (cache still
+// loading) it returns true so a possible embed change is never missed.
+func (g *graphServer) IsEmbedFile(path string) bool {
+	p := filepath.ToSlash(path)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.embedReady {
+		return true
+	}
+	if g.embedFiles[p] {
+		return true
+	}
+	for _, root := range g.embedPrefixes {
+		if p == root || strings.HasPrefix(p, root+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // saveDiskCache writes the current graph to the on-disk cache file.
@@ -334,6 +542,7 @@ func (g *graphServer) build(patterns []string, dir, key string) {
 	g.stale = false
 	g.building = false
 	g.mu.Unlock()
+	g.setEmbedFromPackages(all)
 	g.log.Printf("driver: graph built in %s (%d packages, %d roots, %dMB)",
 		time.Since(start).Round(time.Millisecond), len(all), len(rootIDs), len(b)>>20)
 	go g.saveDiskCache(b, key, patterns, dir)

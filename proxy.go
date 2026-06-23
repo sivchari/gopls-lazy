@@ -502,10 +502,12 @@ func (p *proxy) observeFileEvent(uri string) {
 		return
 	}
 	if !strings.HasSuffix(path, ".go") {
-		// Possibly an embedded asset (//go:embed): the package graph's
-		// EmbedFiles may have changed.
-		if p.graph != nil {
-			p.graph.MarkStale("non-go file changed: " + base)
+		// A non-Go file affects the package graph only when it is an //go:embed
+		// asset. Invalidating on every non-Go change (build output, generated
+		// JSON, editor temp files) would fire a full `go list ./...` rebuild on
+		// noise and starve type-checking, so check the embed footprint first.
+		if p.graph != nil && p.graph.IsEmbedFile(path) {
+			p.graph.MarkStale("embedded asset changed: " + base)
 		}
 		return
 	}

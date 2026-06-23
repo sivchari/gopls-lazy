@@ -26,6 +26,13 @@ No server, no shared cache, no infrastructure.
   repeated `go list ./...` (10-15s each on a 3.6k-package repo). Unknown or
   stale queries return `NotHandled` and fall back to the real go list, so
   correctness never depends on the cache.
+- **Fast warm start**: the on-disk graph is served immediately, and the
+  revalidating `go list ./...` is deferred past the initial burst of file
+  opens (sooner when a module file changed, later when nothing did) so it
+  never competes with type-checking during startup. The cache is invalidated
+  only by module-file changes and by changes to files an `//go:embed` pattern
+  actually covers — not by every unrelated non-Go file, which would otherwise
+  re-list the whole module on editor file-watch noise.
 
 ## Usage
 
@@ -38,15 +45,19 @@ gopls-lazy [flags]
   -debounce dur      coalesce window for scope changes (default 500ms)
   -evict dur         drop units with no open files after this idle time
                      (default 10m; 0 disables)
-  -driver=bool       GOPACKAGESDRIVER graph cache (default true)
   -log path          debug log
 ```
 
 Unrecognized flags are forwarded to gopls, so the proxy is a drop-in
 replacement for the gopls binary. Every flag can also be set via environment
 variables (`GOPLS_LAZY_GOPLS`, `GOPLS_LAZY_GRANULARITY`,
-`GOPLS_LAZY_DEBOUNCE`, `GOPLS_LAZY_EVICT`, `GOPLS_LAZY_DRIVER=false`,
-`GOPLS_LAZY_LOG`) for editors that cannot pass arguments.
+`GOPLS_LAZY_DEBOUNCE`, `GOPLS_LAZY_EVICT`, `GOPLS_LAZY_LOG`) for editors that
+cannot pass arguments.
+
+The GOPACKAGESDRIVER graph cache is on by default and falls back to the real
+`go list` automatically when it cannot help, so it rarely needs touching. It
+can be disabled for troubleshooting with `GOPLS_LAZY_DRIVER=false` (or
+`-driver=false`).
 
 ### VS Code
 
@@ -78,8 +89,9 @@ Other gopls settings pass through untouched (the proxy patches
 | opening a second service, full features | n/a | 4.3s |
 | references on a package outside the scope | partial results | correct, 3.8s |
 
-The proxy spends ~13s of background CPU once per session building the graph
-cache and ~1.6s building the reverse-import index; both are included above.
+The proxy spends ~1.6s building the reverse-import index per session. The
+~13s graph-cache build is served from disk on warm starts and revalidated in
+the background, deferred so it does not compete with the first file opens.
 
 ## Scope lifecycle
 
@@ -91,9 +103,10 @@ cache and ~1.6s building the reverse-import index; both are included above.
   whole workspace — methods can be reached through interfaces from packages
   that never import the defining package, so the closure is not enough. The
   widening expires after the eviction TTL.
-- `//go:embed` directive changes and non-Go file events invalidate the graph
-  cache (it rebuilds in the background; queries fall back to go list until
-  it is fresh).
+- `//go:embed` directive changes and changes to files an embed pattern
+  actually covers invalidate the graph cache (it rebuilds in the background;
+  queries fall back to go list until it is fresh). Unrelated non-Go file
+  events are ignored, so file-watch noise does not trigger a full re-list.
 
 ## Current limitations
 
