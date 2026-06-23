@@ -1,4 +1,4 @@
-package main
+package goplslazy
 
 import (
 	"encoding/json"
@@ -14,16 +14,17 @@ import (
 
 // interceptCrossRef handles rename/references/implementation requests.
 // They are answered correctly only if every package that can mention the
-// symbol is in scope, so the request is held while the proxy:
+// symbol is in scope, so the proxy:
 //
 //  1. resolves the symbol's defining location (a definition request to
 //     gopls, which works because the requesting file's package and its deps
 //     are already loaded),
 //  2. decides the required scope: the reverse-import closure of the
-//     defining package, or the whole workspace for method symbols (methods
-//     can be called through interfaces from packages that never import the
-//     defining package) and for implementation requests,
-//  3. expands the scope, waits for the reload, and forwards the request.
+//     defining package, or an isolated worker gopls for method symbols
+//     (methods can be called through interfaces from packages that never
+//     import the defining package) and for implementation requests,
+//  3. expands the main gopls scope for closure-safe requests, or runs the
+//     request in the worker and returns its response directly.
 //
 // Returns true if the request was taken over (always, for in-root files).
 func (p *proxy) interceptCrossRef(raw []byte, m *message) bool {
@@ -80,37 +81,33 @@ func (p *proxy) resolveAndExpand(method, uri string, line, char int, held []byte
 	}
 	relDir = filepath.ToSlash(relDir)
 
-	wholeWorkspace := method == "textDocument/implementation" || isMethodDecl(defPath, defLine+1)
+	wholeWorkspace := method == methodImplementation ||
+		(methodNeedsGlobalMethodRefs(method) && isMethodDecl(defPath, defLine+1))
 
-	if !wholeWorkspace && !p.idx.WaitReady(30*time.Second) {
+	if wholeWorkspace {
+		p.serveViaWorker(method, held)
+		return
+	}
+
+	if !p.idx.WaitReady(30 * time.Second) {
 		p.log.Printf("crossref %s: index not ready in time, forwarding as-is", method)
 		p.toServer.write(held)
 		return
 	}
 
 	p.mu.Lock()
-	var reason string
-	expanded := false
-	if wholeWorkspace {
-		if p.fullUntil.IsZero() {
-			expanded = true
+	units := p.idx.ClosureUnits(relDir, p.opts.granularity)
+	var need []string
+	for _, u := range units {
+		if p.scope[u] == nil {
+			need = append(need, u)
 		}
-		p.fullUntil = time.Now().Add(max(p.opts.evictTTL, 10*time.Minute))
-		reason = "whole workspace (method or implementation)"
-	} else {
-		units := p.idx.ClosureUnits(relDir, p.opts.granularity)
-		var need []string
-		for _, u := range units {
-			if p.scope[u] == nil {
-				need = append(need, u)
-			}
-		}
-		for _, u := range need {
-			p.scope[u] = &scopeEntry{open: map[string]bool{}, lastActive: time.Now()}
-		}
-		expanded = len(need) > 0
-		reason = fmt.Sprintf("closure of %s: +%v", relDir, need)
 	}
+	for _, u := range need {
+		p.scope[u] = &scopeEntry{open: map[string]bool{}, lastActive: time.Now()}
+	}
+	expanded := len(need) > 0
+	reason := fmt.Sprintf("closure of %s: +%v", relDir, need)
 	if !expanded {
 		p.mu.Unlock()
 		p.toServer.write(held)
@@ -125,6 +122,51 @@ func (p *proxy) resolveAndExpand(method, uri string, line, char int, held []byte
 	p.log.Printf("crossref %s: %s, holding request", method, reason)
 	p.mu.Unlock()
 	p.pushScope()
+}
+
+// serveViaWorker answers a cross-reference request from a short-lived isolated
+// gopls worker that loads the whole workspace, so the long-lived interactive
+// gopls is never widened. Concurrent identical requests (same method and
+// params) are coalesced via singleflight so a burst of repeats spawns a single
+// worker instead of one heavy gopls process each.
+func (p *proxy) serveViaWorker(method string, held []byte) {
+	p.log.Printf("crossref %s: isolated worker for method or implementation", method)
+	var req message
+	if json.Unmarshal(held, &req) != nil || req.ID == nil {
+		p.toServer.write(held)
+		return
+	}
+	key := method + "\x00" + string(req.Params)
+	v, err, shared := p.workerSF.Do(key, func() (any, error) {
+		return p.runWorkerRequest(held)
+	})
+	if err != nil {
+		p.log.Printf("crossref %s: worker failed: %v; forwarding to current main gopls scope", method, err)
+		p.toServer.write(held)
+		return
+	}
+	resp, ok := v.(*message)
+	if !ok || resp == nil {
+		p.toServer.write(held)
+		return
+	}
+	if shared {
+		p.log.Printf("crossref %s: reused in-flight worker result", method)
+	}
+	if len(resp.Error) > 0 {
+		p.respondError(req.ID, resp.Error)
+		return
+	}
+	p.respond(req.ID, resp.Result)
+}
+
+func methodNeedsGlobalMethodRefs(method string) bool {
+	switch method {
+	case methodReferences, methodRename:
+		return true
+	default:
+		return false
+	}
 }
 
 type defLocation struct {
@@ -142,14 +184,18 @@ func (p *proxy) askDefinition(uri string, line, char int) *defLocation {
 	p.pendingOwn[id] = ch
 	p.mu.Unlock()
 
-	req := map[string]any{
-		"jsonrpc": "2.0",
-		"id":      json.RawMessage(id),
-		"method":  "textDocument/definition",
-		"params": map[string]any{
-			"textDocument": map[string]any{"uri": uri},
-			"position":     map[string]any{"line": line, "character": char},
-		},
+	params, err := json.Marshal(map[string]any{
+		"textDocument": textDocumentIdentifier{URI: uri},
+		"position":     lspPosition{Line: line, Character: char},
+	})
+	if err != nil {
+		return nil
+	}
+	req := message{
+		JSONRPC: jsonrpcVersion,
+		ID:      json.RawMessage(id),
+		Method:  "textDocument/definition",
+		Params:  params,
 	}
 	raw, err := json.Marshal(req)
 	if err != nil {

@@ -1,4 +1,4 @@
-package main
+package goplslazy
 
 import (
 	"crypto/sha256"

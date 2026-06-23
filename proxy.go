@@ -1,4 +1,4 @@
-package main
+package goplslazy
 
 import (
 	"bufio"
@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sync/singleflight"
 )
 
 type message struct {
@@ -37,9 +39,11 @@ type proxy struct {
 	mu           sync.Mutex
 	root         string                 // workspace root filesystem path
 	scope        map[string]*scopeEntry // scope units relative to root
-	fullUntil    time.Time              // while set, the whole workspace is in scope
-	userFilters  []string               // editor's own directoryFilters, restored for full scope
+	userFilters  []string               // editor's own directoryFilters, restored for root-level files
 	configIDs    map[string]bool        // ids of pending server->client workspace/configuration requests
+	workerInit   json.RawMessage        // original initialize params for isolated worker gopls processes
+	workerConfig []json.RawMessage      // original workspace/configuration settings, before lazy filters
+	openDocs     map[string]openDoc     // current open document overlays for worker gopls processes
 	pendingDiag  map[string]bool        // opened uris whose first diagnostics have not arrived yet
 	rescopeTimer *time.Timer
 	held         [][]byte // requests waiting for the re-scoped view
@@ -47,6 +51,8 @@ type proxy struct {
 	holdTimer    *time.Timer
 	pendingOwn   map[string]chan *message // proxy-originated request ids -> response channel
 	ownSeq       int
+
+	workerSF singleflight.Group // dedups concurrent identical isolated-worker requests
 
 	idx   *revIndex
 	graph *graphServer
@@ -121,34 +127,59 @@ func (p *proxy) pumpClient(r *bufio.Reader) {
 			p.toServer.write(raw)
 			continue
 		}
-		switch {
-		case m.Method == "initialize":
+		if m.ID != nil && p.interceptClientRequest(raw, &m) {
+			continue // held or answered by the proxy
+		}
+		switch m.Method {
+		case "initialize":
 			raw = p.patchInitialize(raw, &m)
-		case m.Method == "textDocument/didOpen":
+		case "textDocument/didOpen":
+			p.trackDidOpen(m.Params)
 			p.observeOpen(m.Params)
-		case m.Method == "textDocument/didClose":
+		case "textDocument/didChange":
+			p.trackDidChange(m.Params)
+		case "textDocument/didClose":
+			p.trackDidClose(m.Params)
 			p.observeClose(m.Params)
-		case m.Method == "textDocument/didSave":
+		case "textDocument/didSave":
 			p.observeFileEvent(docURI(m.Params))
-		case m.Method == "workspace/didChangeWatchedFiles":
+		case "workspace/didChangeWatchedFiles":
 			p.observeWatchedFiles(m.Params)
-		case isCrossRef(m.Method) && m.ID != nil:
-			if p.interceptCrossRef(raw, &m) {
-				continue // held; forwarded after the re-scope settles
-			}
-		case m.Method == "" && m.ID != nil:
-			// A response from the editor; patch it if it answers a
-			// workspace/configuration request we saw going out.
-			p.mu.Lock()
-			isConfig := p.configIDs[string(m.ID)]
-			delete(p.configIDs, string(m.ID))
-			p.mu.Unlock()
-			if isConfig {
-				raw = p.patchConfigResponse(raw, &m)
-			}
+		case "":
+			raw = p.patchClientResponse(raw, &m)
 		}
 		p.toServer.write(raw)
 	}
+}
+
+// interceptClientRequest takes over editor requests the proxy answers itself
+// (workspace symbols) or holds until the scope is wide enough (cross-refs).
+// It returns true when the request was swallowed and must not be forwarded.
+func (p *proxy) interceptClientRequest(raw []byte, m *message) bool {
+	switch {
+	case m.Method == "workspace/symbol":
+		return p.interceptWorkspaceSymbol(raw, m)
+	case isCrossRef(m.Method):
+		return p.interceptCrossRef(raw, m)
+	default:
+		return false
+	}
+}
+
+// patchClientResponse patches an editor->gopls response if it answers a
+// workspace/configuration request the proxy saw going out.
+func (p *proxy) patchClientResponse(raw []byte, m *message) []byte {
+	if m.ID == nil {
+		return raw
+	}
+	p.mu.Lock()
+	isConfig := p.configIDs[string(m.ID)]
+	delete(p.configIDs, string(m.ID))
+	p.mu.Unlock()
+	if isConfig {
+		return p.patchConfigResponse(raw, m)
+	}
+	return raw
 }
 
 // pumpServer forwards gopls->editor traffic. It remembers ids of
@@ -193,11 +224,72 @@ func (p *proxy) pumpServer(r *bufio.Reader) {
 
 func isCrossRef(method string) bool {
 	switch method {
-	case "textDocument/rename", "textDocument/prepareRename",
-		"textDocument/references", "textDocument/implementation":
+	case methodRename, "textDocument/prepareRename",
+		methodReferences, methodImplementation:
 		return true
 	}
 	return false
+}
+
+func (p *proxy) interceptWorkspaceSymbol(raw []byte, m *message) bool {
+	var params struct {
+		Query string `json:"query"`
+	}
+	if json.Unmarshal(m.Params, &params) != nil {
+		return false
+	}
+	p.mu.Lock()
+	hasRoot := p.root != ""
+	p.mu.Unlock()
+	if !hasRoot {
+		return false
+	}
+	id := append(json.RawMessage(nil), m.ID...)
+	query := params.Query
+	held := append([]byte(nil), raw...)
+	go func() {
+		if !p.idx.WaitReady(10 * time.Second) {
+			p.log.Printf("workspace/symbol: index not ready in time, forwarding to gopls")
+			p.toServer.write(held)
+			return
+		}
+		symbols := p.idx.WorkspaceSymbols(query)
+		p.respond(id, symbols)
+		p.log.Printf("workspace/symbol: query=%q results=%d", query, len(symbols))
+	}()
+	return true
+}
+
+func (p *proxy) respond(id json.RawMessage, result any) {
+	b, err := json.Marshal(result)
+	if err != nil {
+		return
+	}
+	resp := message{
+		JSONRPC: jsonrpcVersion,
+		ID:      id,
+		Result:  b,
+	}
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
+	p.toClient.write(raw)
+}
+
+// respondError sends a JSON-RPC error response carrying the given error object
+// back to the editor under the supplied request id.
+func (p *proxy) respondError(id, lspError json.RawMessage) {
+	resp := message{
+		JSONRPC: jsonrpcVersion,
+		ID:      id,
+		Error:   lspError,
+	}
+	raw, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
+	p.toClient.write(raw)
 }
 
 func (p *proxy) patchInitialize(raw []byte, m *message) []byte {
@@ -237,6 +329,13 @@ func (p *proxy) patchInitialize(raw []byte, m *message) []byte {
 		opts = map[string]any{}
 	}
 	p.captureUserFilters(opts)
+	workerParams := cloneMap(params)
+	workerParams["initializationOptions"] = cloneMap(opts)
+	if b, err := json.Marshal(workerParams); err == nil {
+		p.mu.Lock()
+		p.workerInit = b
+		p.mu.Unlock()
+	}
 	p.mu.Lock()
 	setFilters(opts, p.filtersLocked())
 	p.mu.Unlock()
@@ -262,11 +361,20 @@ func (p *proxy) patchConfigResponse(raw []byte, m *message) []byte {
 	if json.Unmarshal(m.Result, &items) != nil {
 		return raw
 	}
+	workerConfig := make([]json.RawMessage, 0, len(items))
 	for _, it := range items {
 		if obj, _ := it.(map[string]any); obj != nil {
 			p.captureUserFilters(obj)
 		}
+		if b, err := json.Marshal(it); err == nil {
+			workerConfig = append(workerConfig, b)
+		} else {
+			workerConfig = append(workerConfig, json.RawMessage(`{}`))
+		}
 	}
+	p.mu.Lock()
+	p.workerConfig = workerConfig
+	p.mu.Unlock()
 	p.mu.Lock()
 	fs := p.filtersLocked()
 	p.mu.Unlock()
@@ -290,8 +398,24 @@ func (p *proxy) patchConfigResponse(raw []byte, m *message) []byte {
 	return out
 }
 
+func cloneMap(in map[string]any) map[string]any {
+	if in == nil {
+		return map[string]any{}
+	}
+	b, err := json.Marshal(in)
+	if err != nil {
+		return map[string]any{}
+	}
+	var out map[string]any
+	if json.Unmarshal(b, &out) != nil || out == nil {
+		return map[string]any{}
+	}
+	return out
+}
+
 // captureUserFilters remembers the editor's own directoryFilters so they can
-// be restored when the proxy temporarily widens to the whole workspace.
+// be restored when a root-level Go file forces the proxy to disable lazy
+// filters.
 func (p *proxy) captureUserFilters(settings map[string]any) {
 	v, ok := settings["directoryFilters"]
 	if !ok {
@@ -389,8 +513,7 @@ func (p *proxy) observeClose(params json.RawMessage) {
 	}
 }
 
-// evictLoop drops scope units that have had no open files for the TTL, and
-// ends temporary whole-workspace widenings.
+// evictLoop drops scope units that have had no open files for the TTL.
 func (p *proxy) evictLoop() {
 	ttl := p.opts.evictTTL
 	tick := time.NewTicker(time.Minute)
@@ -405,11 +528,6 @@ func (p *proxy) evictLoop() {
 				p.log.Printf("scope -= %s (idle %s)", unit, ttl)
 				changed = true
 			}
-		}
-		if !p.fullUntil.IsZero() && now.After(p.fullUntil) {
-			p.fullUntil = time.Time{}
-			p.log.Printf("full-workspace widening expired")
-			changed = true
 		}
 		p.mu.Unlock()
 		if changed {

@@ -1,4 +1,4 @@
-package main
+package goplslazy
 
 import (
 	"encoding/json"
@@ -13,17 +13,8 @@ import (
 const filterExcludeAll = "-**"
 
 // filtersLocked returns the directoryFilters for the current scope. The
-// caller must hold p.mu. During a temporary whole-workspace widening it
-// returns the editor's own filters (or the gopls default): the key must be
-// SET explicitly, because gopls layers workspace/configuration over
-// initializationOptions and an absent key would keep the old value.
+// caller must hold p.mu.
 func (p *proxy) filtersLocked() []string {
-	if !p.fullUntil.IsZero() {
-		if len(p.userFilters) > 0 {
-			return p.userFilters
-		}
-		return []string{"-**/node_modules"}
-	}
 	dirs := make([]string, 0, len(p.scope))
 	for d := range p.scope {
 		dirs = append(dirs, d)
@@ -83,7 +74,7 @@ func (p *proxy) unitFor(path string) (string, bool) {
 // The new scope is also persisted to disk so the next session can restore it.
 func (p *proxy) pushScope() {
 	note := message{
-		JSONRPC: "2.0",
+		JSONRPC: jsonrpcVersion,
 		Method:  "workspace/didChangeConfiguration",
 		Params:  json.RawMessage(`{"settings":{}}`),
 	}
@@ -92,11 +83,7 @@ func (p *proxy) pushScope() {
 		return
 	}
 	p.mu.Lock()
-	if !p.fullUntil.IsZero() {
-		p.log.Printf("rescope: full workspace via %v (until %s)", p.filtersLocked(), p.fullUntil.Format("15:04:05"))
-	} else {
-		p.log.Printf("rescope: filters=%v", p.filtersLocked())
-	}
+	p.log.Printf("rescope: filters=%v", p.filtersLocked())
 	p.mu.Unlock()
 	p.toServer.write(raw)
 	go p.saveScope()

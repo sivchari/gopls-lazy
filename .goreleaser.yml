@@ -8,7 +8,7 @@ before:
 
 builds:
   - id: gopls-lazy
-    main: .
+    main: ./cmd/gopls-lazy
     binary: gopls-lazy
     env:
       - CGO_ENABLED=0

@@ -3,7 +3,7 @@
 BINARY_NAME=gopls-lazy
 
 build:
-	go build -o $(BINARY_NAME) .
+	go build -o $(BINARY_NAME) ./cmd/$(BINARY_NAME)
 
 test:
 	go test -race ./...

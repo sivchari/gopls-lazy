@@ -16,10 +16,14 @@ No server, no shared cache, no infrastructure.
 - **Two-stage rescope**: an opened file is served immediately in gopls's
   orphan mode (diagnostics in ~1s); the workspace reload happens right
   after, so first feedback is never blocked.
-- **Reverse-import index**: `rename` / `references` / `implementation`
-  requests are held while the scope expands with the reverse-import closure
-  of the target package (built by parsing import clauses only; 24k files
-  index in ~1.6s), so results are never silently truncated.
+- **Reverse-import index**: `rename` / `references` requests are held while
+  the scope expands with the reverse-import closure of the target package
+  (built by parsing import clauses only; 24k files index in ~1.6s), so
+  results are never silently truncated.
+- **Isolated global queries**: `implementation` and method-wide references
+  run in a short-lived worker gopls process. The interactive gopls process is
+  kept scoped to the packages you are editing and is never widened to the
+  whole workspace for these expensive queries.
 - **GOPACKAGESDRIVER graph cache**: the same binary acts as a
   `GOPACKAGESDRIVER`. The proxy caches the package graph for the workspace
   load pattern and serves every re-scope from memory, eliminating the
@@ -99,10 +103,9 @@ the background, deferred so it does not compete with the first file opens.
   after `-evict` (default 10m) of inactivity.
 - rename/references resolve the symbol's defining package first (a
   definition request to gopls), then expand to its reverse-import closure.
-- Method symbols and `implementation` requests temporarily widen to the
-  whole workspace — methods can be reached through interfaces from packages
-  that never import the defining package, so the closure is not enough. The
-  widening expires after the eviction TTL.
+- Method symbols and `implementation` requests run in an isolated worker
+  gopls process — methods can be reached through interfaces from packages
+  that never import the defining package, so the closure is not enough.
 - `//go:embed` directive changes and changes to files an embed pattern
   actually covers invalidate the graph cache (it rebuilds in the background;
   queries fall back to go list until it is fresh). Unrelated non-Go file
@@ -114,6 +117,7 @@ the background, deferred so it does not compete with the first file opens.
   the definition itself is not resolvable in the current scope (rare: the
   requesting file's package always has its dependencies loaded), the proxy
   falls back to the requesting file's package for closure computation.
-- A whole-workspace widening on a big monorepo costs what plain gopls costs
-  on every startup; with a warm gopls cache it is seconds, cold it can be
-  minutes of background CPU.
+- Worker-backed global queries still cost what gopls needs to answer them;
+  with a warm gopls cache it is seconds, cold it can be minutes of background
+  CPU. The difference is that the memory belongs to the worker process and is
+  released when that process exits.

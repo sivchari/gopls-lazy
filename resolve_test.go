@@ -1,4 +1,4 @@
-package main
+package goplslazy
 
 import (
 	"os"
@@ -40,5 +40,22 @@ type I interface {
 				t.Errorf("isMethodDecl(line %d) = %v, want %v", tt.line, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestMethodNeedsGlobalMethodRefs(t *testing.T) {
+	tests := []struct {
+		method string
+		want   bool
+	}{
+		{"textDocument/references", true},
+		{"textDocument/rename", true},
+		{"textDocument/prepareRename", false},
+		{"textDocument/implementation", false},
+	}
+	for _, tt := range tests {
+		if got := methodNeedsGlobalMethodRefs(tt.method); got != tt.want {
+			t.Errorf("methodNeedsGlobalMethodRefs(%q) = %v, want %v", tt.method, got, tt.want)
+		}
 	}
 }
