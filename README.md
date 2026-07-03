@@ -83,6 +83,12 @@ require("lspconfig").gopls.setup({
 Other gopls settings pass through untouched (the proxy patches
 `initialize` options and `workspace/configuration` responses only).
 
+`directoryFilters` is the one exception: the proxy owns this option to widen
+and narrow the workspace, so a `directoryFilters` (or `build.directoryFilters`)
+value in your editor's gopls settings is removed and ignored. Manual filter
+allowlists that existed to keep gopls small are no longer needed — that is
+exactly what gopls-lazy automates.
+
 ## Measured on a production monorepo (24k Go files, single go.mod, cold cache)
 
 | metric | plain gopls | gopls-lazy |

@@ -1,11 +1,13 @@
 package goplslazy
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -119,6 +121,197 @@ func TestGraphFresh_GoWorkSubmodule(t *testing.T) {
 	chtime(subMod, time.Now().Add(time.Hour))
 	if graphFresh(cache, dir) {
 		t.Error("a newer go.work sub-module go.mod should make the cache stale")
+	}
+}
+
+func TestRewriteRoot(t *testing.T) {
+	resp := []byte(`{"GoFiles":["/old/repo/pkg/a.go"],"Dir":"/old/repo",` +
+		`"Sibling":"/old/repo-copy/pkg/a.go","Dep":"/home/u/go/pkg/mod/x@v1/a.go","ID":"example.com/old/repo/pkg"}`)
+	got := string(rewriteRoot(resp, "/old/repo", "/new/wt"))
+	want := `{"GoFiles":["/new/wt/pkg/a.go"],"Dir":"/new/wt",` +
+		`"Sibling":"/old/repo-copy/pkg/a.go","Dep":"/home/u/go/pkg/mod/x@v1/a.go","ID":"example.com/old/repo/pkg"}`
+	if got != want {
+		t.Errorf("rewriteRoot() = %s, want %s", got, want)
+	}
+}
+
+// BenchmarkRewriteRoot measures the cost the worktree retargeting adds to a
+// warm startup, on a payload the size of a production monorepo graph cache.
+func BenchmarkRewriteRoot(b *testing.B) {
+	var buf []byte
+	buf = append(buf, `{"Packages":[`...)
+	for i := 0; len(buf) < 32<<20; i++ {
+		buf = append(buf, `{"GoFiles":["/old/checkout/go/services/auth/internal/tokens/file`...)
+		buf = strconv.AppendInt(buf, int64(i), 10)
+		buf = append(buf, `.go"],"Dir":"/old/checkout"},`...)
+	}
+	buf = append(buf, `{}]}`...)
+	b.SetBytes(int64(len(buf)))
+	b.ReportAllocs()
+	for b.Loop() {
+		rewriteRoot(buf, "/old/checkout", "/new/worktree")
+	}
+}
+
+func TestRetargetGraph(t *testing.T) {
+	tests := []struct {
+		name     string
+		saved    savedGraph
+		root     string
+		wantResp string
+		wantDir  string
+		wantOK   bool
+	}{
+		{
+			name:     "same root passes through",
+			saved:    savedGraph{Resp: []byte(`{"f":"/repo/a.go"}`), Dir: "/repo", Root: "/repo"},
+			root:     "/repo",
+			wantResp: `{"f":"/repo/a.go"}`,
+			wantDir:  "/repo",
+			wantOK:   true,
+		},
+		{
+			name:     "other worktree rewrites paths and dir",
+			saved:    savedGraph{Resp: []byte(`{"f":"/repo/a.go"}`), Dir: "/repo", Root: "/repo"},
+			root:     "/wt",
+			wantResp: `{"f":"/wt/a.go"}`,
+			wantDir:  "/wt",
+			wantOK:   true,
+		},
+		{
+			name:     "dir under root is remapped",
+			saved:    savedGraph{Resp: []byte(`{}`), Dir: "/repo/sub", Root: "/repo"},
+			root:     "/wt",
+			wantResp: `{}`,
+			wantDir:  "/wt/sub",
+			wantOK:   true,
+		},
+		{
+			name:     "legacy cache without root falls back to dir",
+			saved:    savedGraph{Resp: []byte(`{"f":"/repo/a.go"}`), Dir: "/repo"},
+			root:     "/wt",
+			wantResp: `{"f":"/wt/a.go"}`,
+			wantDir:  "/wt",
+			wantOK:   true,
+		},
+		{
+			name:     "empty current root passes through",
+			saved:    savedGraph{Resp: []byte(`{"f":"/repo/a.go"}`), Dir: "/repo", Root: "/repo"},
+			root:     "",
+			wantResp: `{"f":"/repo/a.go"}`,
+			wantDir:  "/repo",
+			wantOK:   true,
+		},
+		{
+			name:   "dir outside root cannot be retargeted",
+			saved:  savedGraph{Resp: []byte(`{}`), Dir: "/elsewhere", Root: "/repo"},
+			root:   "/wt",
+			wantOK: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resp, dir, ok := retargetGraph(&tt.saved, tt.root)
+			if ok != tt.wantOK {
+				t.Fatalf("retargetGraph() ok = %v, want %v", ok, tt.wantOK)
+			}
+			if !ok {
+				return
+			}
+			if string(resp) != tt.wantResp {
+				t.Errorf("retargetGraph() resp = %s, want %s", resp, tt.wantResp)
+			}
+			if dir != tt.wantDir {
+				t.Errorf("retargetGraph() dir = %s, want %s", dir, tt.wantDir)
+			}
+		})
+	}
+}
+
+func TestDirCompatible(t *testing.T) {
+	tests := []struct {
+		name      string
+		dir       string
+		cachedDir string
+		want      bool
+	}{
+		{"same dir", "/repo", "/repo", true},
+		{"subdirectory", "/repo/sub", "/repo", true},
+		{"other checkout", "/wt", "/repo", false},
+		{"sibling sharing prefix", "/repo-copy", "/repo", false},
+		{"empty query dir", "", "/repo", true},
+		{"empty cached dir", "/repo", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := dirCompatible(tt.dir, tt.cachedDir); got != tt.want {
+				t.Errorf("dirCompatible(%q, %q) = %v, want %v", tt.dir, tt.cachedDir, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestGraphServer_LoadDiskCache_Retarget(t *testing.T) {
+	root := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "graph.json")
+	saved := savedGraph{
+		Resp:        []byte(`{"Packages":[{"GoFiles":["/old/checkout/pkg/a.go"]}]}`),
+		PatternsKey: "./...",
+		Patterns:    []string{"./..."},
+		Dir:         "/old/checkout",
+		Root:        "/old/checkout",
+	}
+	data, err := json.Marshal(saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cache, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	g := &graphServer{log: log.New(io.Discard, "", 0), cacheFile: cache, root: root}
+	g.loadDiskCache()
+
+	g.mu.Lock()
+	resp, dir := string(g.resp), g.dir
+	g.mu.Unlock()
+	wantResp := `{"Packages":[{"GoFiles":["` + root + `/pkg/a.go"]}]}`
+	if resp != wantResp {
+		t.Errorf("resp = %s, want %s", resp, wantResp)
+	}
+	if dir != root {
+		t.Errorf("dir = %s, want %s", dir, root)
+	}
+}
+
+func TestGraphServer_Answer_DirMismatch(t *testing.T) {
+	otherDir := t.TempDir()
+	g := &graphServer{
+		log:         log.New(io.Discard, "", 0),
+		resp:        []byte(`{"Packages":[{"GoFiles":["/repo/pkg/a.go"]}]}`),
+		patternsKey: "./...",
+		patterns:    []string{"./..."},
+		dir:         "/repo",
+	}
+
+	// A query from another checkout must not be served the cached paths.
+	got := g.answer(driverQuery{Patterns: []string{"./..."}, Dir: otherDir, Request: json.RawMessage(`{}`)})
+	if !bytes.Equal(got, notHandled) {
+		t.Errorf("answer(mismatched dir) = %s, want NotHandled", got)
+	}
+	g.mu.Lock()
+	building := g.building
+	g.mu.Unlock()
+	if !building {
+		t.Error("mismatched workspace query should trigger a rebuild for the new dir")
+	}
+
+	// A query from the cached dir itself is still served.
+	g.mu.Lock()
+	g.building = false
+	g.mu.Unlock()
+	got = g.answer(driverQuery{Patterns: []string{"./..."}, Dir: "/repo", Request: json.RawMessage(`{}`)})
+	if bytes.Equal(got, notHandled) {
+		t.Error("answer(matching dir) should serve the cache, got NotHandled")
 	}
 }
 
