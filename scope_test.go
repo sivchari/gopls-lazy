@@ -37,8 +37,4 @@ func TestFiltersLocked_RootUnit(t *testing.T) {
 	if got := p.filtersLocked(); !reflect.DeepEqual(got, []string{}) {
 		t.Errorf("root-unit filters = %v, want no filters", got)
 	}
-	p.userFilters = []string{"-**/testdata"}
-	if got := p.filtersLocked(); !reflect.DeepEqual(got, []string{"-**/testdata"}) {
-		t.Errorf("root-unit filters = %v, want user filters", got)
-	}
 }

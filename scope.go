@@ -12,6 +12,10 @@ import (
 // filterExcludeAll is the directoryFilter pattern that excludes every package.
 const filterExcludeAll = "-**"
 
+// optionDirectoryFilters is the gopls option the proxy owns to scope the
+// workspace.
+const optionDirectoryFilters = "directoryFilters"
+
 // filtersLocked returns the directoryFilters for the current scope. The
 // caller must hold p.mu.
 func (p *proxy) filtersLocked() []string {
@@ -28,9 +32,6 @@ func (p *proxy) filtersLocked() []string {
 	// root-level Go files are uncommon.
 	for _, d := range dirs {
 		if d == "." {
-			if len(p.userFilters) > 0 {
-				return p.userFilters
-			}
 			return []string{}
 		}
 	}
@@ -44,7 +45,7 @@ func (p *proxy) filtersLocked() []string {
 
 // setFilters applies the proxy's filters to a gopls settings object.
 func setFilters(settings map[string]any, filters []string) {
-	settings["directoryFilters"] = filters
+	settings[optionDirectoryFilters] = filters
 }
 
 // unitFor maps an absolute file path to its scope unit relative to the

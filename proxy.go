@@ -39,7 +39,6 @@ type proxy struct {
 	mu           sync.Mutex
 	root         string                 // workspace root filesystem path
 	scope        map[string]*scopeEntry // scope units relative to root
-	userFilters  []string               // editor's own directoryFilters, restored for root-level files
 	configIDs    map[string]bool        // ids of pending server->client workspace/configuration requests
 	workerInit   json.RawMessage        // original initialize params for isolated worker gopls processes
 	workerConfig []json.RawMessage      // original workspace/configuration settings, before lazy filters
@@ -328,7 +327,7 @@ func (p *proxy) patchInitialize(raw []byte, m *message) []byte {
 	if opts == nil {
 		opts = map[string]any{}
 	}
-	p.captureUserFilters(opts)
+	stripUserFilters(opts)
 	workerParams := cloneMap(params)
 	workerParams["initializationOptions"] = cloneMap(opts)
 	if b, err := json.Marshal(workerParams); err == nil {
@@ -349,7 +348,7 @@ func (p *proxy) patchInitialize(raw []byte, m *message) []byte {
 	if err != nil {
 		return raw
 	}
-	p.log.Printf("initialize: root=%s filters=%v", root, opts["directoryFilters"])
+	p.log.Printf("initialize: root=%s filters=%v", root, opts[optionDirectoryFilters])
 	return out
 }
 
@@ -364,7 +363,7 @@ func (p *proxy) patchConfigResponse(raw []byte, m *message) []byte {
 	workerConfig := make([]json.RawMessage, 0, len(items))
 	for _, it := range items {
 		if obj, _ := it.(map[string]any); obj != nil {
-			p.captureUserFilters(obj)
+			stripUserFilters(obj)
 		}
 		if b, err := json.Marshal(it); err == nil {
 			workerConfig = append(workerConfig, b)
@@ -413,28 +412,20 @@ func cloneMap(in map[string]any) map[string]any {
 	return out
 }
 
-// captureUserFilters remembers the editor's own directoryFilters so they can
-// be restored when a root-level Go file forces the proxy to disable lazy
-// filters.
-func (p *proxy) captureUserFilters(settings map[string]any) {
-	v, ok := settings["directoryFilters"]
-	if !ok {
-		return
-	}
-	arr, ok := v.([]any)
-	if !ok {
-		return
-	}
-	var fs []string
-	for _, e := range arr {
-		if s, ok := e.(string); ok {
-			fs = append(fs, s)
+// stripUserFilters removes every spelling of directoryFilters from a settings
+// object: the flat key, hierarchical dotted names ("build.directoryFilters" —
+// gopls uses only the last segment of a dotted name, so it is the same
+// option), and the nested "build" section. The proxy owns this option; leaving
+// the user's value next to the injected one would make gopls see a duplicate
+// and apply whichever the settings-map iteration happens to visit last.
+func stripUserFilters(settings map[string]any) {
+	for k := range settings {
+		if k == optionDirectoryFilters || strings.HasSuffix(k, "."+optionDirectoryFilters) {
+			delete(settings, k)
 		}
 	}
-	if len(fs) > 0 && fs[0] != filterExcludeAll { // ignore our own injected value
-		p.mu.Lock()
-		p.userFilters = fs
-		p.mu.Unlock()
+	if build, _ := settings["build"].(map[string]any); build != nil {
+		delete(build, optionDirectoryFilters)
 	}
 }
 
