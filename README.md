@@ -21,9 +21,12 @@ No server, no shared cache, no infrastructure.
   (built by parsing import clauses only; 24k files index in ~1.6s), so
   results are never silently truncated.
 - **Isolated global queries**: `implementation` and method-wide references
-  run in a short-lived worker gopls process. The interactive gopls process is
-  kept scoped to the packages you are editing and is never widened to the
-  whole workspace for these expensive queries.
+  run in a persistent, lazily-started worker gopls process that loads the whole
+  workspace. The interactive gopls process is kept scoped to the packages you
+  are editing and is never widened for these expensive queries. The first query
+  on a cold worker is slow (the worker warms in the background and a message
+  tells you), but the worker stays warm so later queries return in seconds; it
+  is evicted after an idle TTL.
 - **GOPACKAGESDRIVER graph cache**: the same binary acts as a
   `GOPACKAGESDRIVER`. The proxy caches the package graph for the workspace
   load pattern and serves every re-scope from memory, eliminating the
@@ -49,14 +52,19 @@ gopls-lazy [flags]
   -debounce dur      coalesce window for scope changes (default 500ms)
   -evict dur         drop units with no open files after this idle time
                      (default 10m; 0 disables)
+  -worker-ttl dur    evict the whole-workspace worker after this idle time
+                     (default 15m; 0 disables)
+  -worker-timeout dur budget for a single worker query (default 10m)
+  -worker-warm       start the worker at initialize instead of on first query
   -log path          debug log
 ```
 
 Unrecognized flags are forwarded to gopls, so the proxy is a drop-in
 replacement for the gopls binary. Every flag can also be set via environment
 variables (`GOPLS_LAZY_GOPLS`, `GOPLS_LAZY_GRANULARITY`,
-`GOPLS_LAZY_DEBOUNCE`, `GOPLS_LAZY_EVICT`, `GOPLS_LAZY_LOG`) for editors that
-cannot pass arguments.
+`GOPLS_LAZY_DEBOUNCE`, `GOPLS_LAZY_EVICT`, `GOPLS_LAZY_WORKER_TTL`,
+`GOPLS_LAZY_WORKER_TIMEOUT`, `GOPLS_LAZY_WORKER_WARM`, `GOPLS_LAZY_LOG`) for
+editors that cannot pass arguments.
 
 The GOPACKAGESDRIVER graph cache is on by default and falls back to the real
 `go list` automatically when it cannot help, so it rarely needs touching. It
@@ -103,9 +111,12 @@ the background, deferred so it does not compete with the first file opens.
   after `-evict` (default 10m) of inactivity.
 - rename/references resolve the symbol's defining package first (a
   definition request to gopls), then expand to its reverse-import closure.
-- Method symbols and `implementation` requests run in an isolated worker
+- Method symbols and `implementation` requests run in the persistent worker
   gopls process — methods can be reached through interfaces from packages
-  that never import the defining package, so the closure is not enough.
+  that never import the defining package, so the closure is not enough. The
+  first such query on a cold worker may take minutes (a `showMessage` tells
+  you it is loading); the worker keeps warming even if that request times out,
+  so a retry succeeds. Later queries reuse the warm worker.
 - `//go:embed` directive changes and changes to files an embed pattern
   actually covers invalidate the graph cache (it rebuilds in the background;
   queries fall back to go list until it is fresh). Unrelated non-Go file
@@ -118,6 +129,11 @@ the background, deferred so it does not compete with the first file opens.
   requesting file's package always has its dependencies loaded), the proxy
   falls back to the requesting file's package for closure computation.
 - Worker-backed global queries still cost what gopls needs to answer them;
-  with a warm gopls cache it is seconds, cold it can be minutes of background
-  CPU. The difference is that the memory belongs to the worker process and is
-  released when that process exits.
+  with a warm worker it is seconds, cold it can be minutes of background CPU.
+  The memory belongs to the worker process and is released when it is evicted
+  (after `-worker-ttl`) or the proxy exits.
+- A `rename` that the worker cannot answer in time returns a retryable
+  `RequestFailed` error rather than silently-partial results (a partial rename
+  is dangerous); references and implementation fall back to the in-scope gopls
+  and warn that results may be incomplete. Retrying once the worker is warm
+  gives complete results.
