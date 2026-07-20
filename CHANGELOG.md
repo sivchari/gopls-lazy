@@ -1,5 +1,9 @@
 # Changelog
 
+## [v0.3.0](https://github.com/sivchari/gopls-lazy/compare/v0.2.0...v0.3.0) - 2026-07-03
+- fix: make definition/references work in git worktrees and own directoryFilters exclusively by @sivchari in https://github.com/sivchari/gopls-lazy/pull/9
+- release v0.3.0 by @sivchari in https://github.com/sivchari/gopls-lazy/pull/11
+
 ## [v0.2.0](https://github.com/sivchari/gopls-lazy/compare/v0.1.1...v0.2.0) - 2026-06-23
 - perf: skip competing graph rebuilds for fast warm startup by @sivchari in https://github.com/sivchari/gopls-lazy/pull/5
 - feat: isolate cross-reference requests in a worker and serve workspace symbols in-proxy by @sivchari in https://github.com/sivchari/gopls-lazy/pull/6

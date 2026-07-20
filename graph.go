@@ -1,6 +1,7 @@
 package goplslazy
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -62,6 +63,7 @@ type savedGraph struct {
 	PatternsKey string   `json:"patternsKey"`
 	Patterns    []string `json:"patterns"`
 	Dir         string   `json:"dir"`
+	Root        string   `json:"root"` // workspace root the graph was built for
 }
 
 // graphCacheKey returns a stable identifier for the graph cache. All git
@@ -243,17 +245,27 @@ func (g *graphServer) loadDiskCache() {
 		return
 	}
 	g.mu.Lock()
-	g.resp = saved.Resp
+	root := g.root
+	g.mu.Unlock()
+	resp, dir, ok := retargetGraph(&saved, root)
+	if !ok {
+		g.log.Printf("driver: disk cache dir %s not under its root %s, ignoring cache", saved.Dir, saved.Root)
+		return
+	}
+	if dir != saved.Dir {
+		g.log.Printf("driver: disk cache retargeted from %s to %s", saved.Dir, dir)
+	}
+	g.mu.Lock()
+	g.resp = resp
 	g.patternsKey = saved.PatternsKey
 	g.patterns = saved.Patterns
-	g.dir = saved.Dir
+	g.dir = dir
 	g.stale = false
-	root := g.root
 	g.mu.Unlock()
 	// Decode the embed footprint off the critical path: the first workspace
 	// query only needs g.resp, which is already published above.
-	go g.setEmbedFromResp(saved.Resp)
-	g.log.Printf("driver: loaded disk cache (%d bytes) from %s", len(saved.Resp), g.cacheFile)
+	go g.setEmbedFromResp(resp)
+	g.log.Printf("driver: loaded disk cache (%d bytes) from %s", len(resp), g.cacheFile)
 
 	// Serve the cached graph immediately and revalidate in the background, but
 	// DEFER the rebuild past the initial burst of file opens so the ~12s
@@ -265,7 +277,7 @@ func (g *graphServer) loadDiskCache() {
 		delay = freshRevalidateDelay
 	}
 	g.log.Printf("driver: disk cache served; background revalidation in %s", delay)
-	patterns, dir, key := saved.Patterns, saved.Dir, saved.PatternsKey
+	patterns, key := saved.Patterns, saved.PatternsKey
 	time.AfterFunc(delay, func() {
 		g.mu.Lock()
 		if g.building {
@@ -276,6 +288,45 @@ func (g *graphServer) loadDiskCache() {
 		g.mu.Unlock()
 		g.build(patterns, dir, key)
 	})
+}
+
+// retargetGraph adapts a saved graph to the current workspace root. Worktrees
+// of the same repository share one cache file (graphCacheKey uses the git
+// common dir), but the DriverResponse inside holds absolute paths of the
+// checkout that built it — served verbatim in another worktree, gopls would
+// find no package for any open file ("no package metadata"). When the saved
+// root differs from the current one, the paths and the build dir are rewritten
+// to the current root; branch drift between checkouts is then picked up by the
+// deferred revalidation, which rebuilds against the returned dir. Returns
+// ok=false when the saved dir does not sit inside the saved root, in which
+// case the cache cannot be retargeted and must be ignored.
+func retargetGraph(saved *savedGraph, root string) (resp []byte, dir string, ok bool) {
+	oldRoot := saved.Root
+	if oldRoot == "" {
+		oldRoot = saved.Dir // cache written before Root was recorded
+	}
+	if root == "" || oldRoot == root {
+		return saved.Resp, saved.Dir, true
+	}
+	switch {
+	case saved.Dir == oldRoot:
+		dir = root
+	case strings.HasPrefix(saved.Dir, oldRoot+string(filepath.Separator)):
+		dir = root + saved.Dir[len(oldRoot):]
+	default:
+		return nil, "", false
+	}
+	return rewriteRoot(saved.Resp, oldRoot, root), dir, true
+}
+
+// rewriteRoot replaces oldRoot with newRoot in every absolute path inside a
+// marshaled DriverResponse. Matches are anchored on the JSON string opening
+// quote and either a path separator or closing quote, so a sibling directory
+// sharing the prefix (repo vs repo-copy) and paths outside the root (the
+// module cache, GOROOT) are never touched.
+func rewriteRoot(resp []byte, oldRoot, newRoot string) []byte {
+	resp = bytes.ReplaceAll(resp, []byte(`"`+oldRoot+`/`), []byte(`"`+newRoot+`/`))
+	return bytes.ReplaceAll(resp, []byte(`"`+oldRoot+`"`), []byte(`"`+newRoot+`"`))
 }
 
 // setEmbedFromResp records the //go:embed footprint from a marshaled
@@ -393,11 +444,15 @@ func (g *graphServer) saveDiskCache(resp []byte, patternsKey string, patterns []
 	if g.cacheFile == "" {
 		return
 	}
+	g.mu.Lock()
+	root := g.root
+	g.mu.Unlock()
 	saved := savedGraph{
 		Resp:        resp,
 		PatternsKey: patternsKey,
 		Patterns:    patterns,
 		Dir:         dir,
+		Root:        root,
 	}
 	b, err := json.Marshal(saved)
 	if err != nil {
@@ -440,6 +495,22 @@ func (g *graphServer) answer(q driverQuery) []byte {
 	stale := g.stale
 	hasCache := resp != nil && key == g.patternsKey
 
+	// A query from outside the cached dir targets another checkout; the cached
+	// absolute paths would be wrong there. Fall back to go list and rebuild for
+	// the queried dir so serving resumes from the right root.
+	if hasCache && !dirCompatible(q.Dir, g.dir) {
+		if isWorkspaceQuery(q.Patterns) && !g.building {
+			g.building = true
+			patterns := append([]string(nil), q.Patterns...)
+			dir := q.Dir
+			go g.build(patterns, dir, key)
+		}
+		cached := g.dir
+		g.mu.Unlock()
+		g.log.Printf("driver: NotHandled (query dir %s does not match cached dir %s)", q.Dir, cached)
+		return notHandled
+	}
+
 	if !hasCache {
 		// No cache at all: trigger a background build for workspace queries
 		// and tell gopls to fall back to the real go list.
@@ -477,6 +548,18 @@ func (g *graphServer) answer(q driverQuery) []byte {
 		g.log.Printf("driver: served %d patterns from cache (%d bytes)", len(q.Patterns), len(resp))
 	}
 	return resp
+}
+
+// dirCompatible reports whether a driver query issued from dir can be served
+// by a graph rooted at cachedDir: the same dir or a subdirectory of it.
+// Anything else means the query targets another checkout. Empty values (an
+// unset root, a query without a dir) are treated as compatible so the guard
+// never regresses the plain single-checkout path.
+func dirCompatible(dir, cachedDir string) bool {
+	if dir == "" || cachedDir == "" || dir == cachedDir {
+		return true
+	}
+	return strings.HasPrefix(dir, cachedDir+string(filepath.Separator))
 }
 
 // isWorkspaceQuery reports whether the patterns look like gopls's initial
