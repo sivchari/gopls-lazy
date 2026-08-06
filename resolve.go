@@ -199,10 +199,8 @@ func (p *proxy) publishUnitsAndForward(method string, units []string, desc strin
 
 // widenRequestingUnitAndForward expands the scope to include only reqPath's
 // own unit — not a reverse-import closure — and forwards held once that unit
-// is applied. Used wherever a full closure computation is out of scope: a
-// cross-module reference (see resolveAndExpand) or a whole-workspace query
-// whose target lives in a nested module the main worker cannot see (see
-// serveViaWorker).
+// is applied. Used when a cross-module reference makes a full closure
+// computation out of scope (see resolveAndExpand).
 func (p *proxy) widenRequestingUnitAndForward(method, reqPath string, held []byte) {
 	unit, ok := p.unitFor(reqPath)
 	if !ok {
@@ -211,16 +209,6 @@ func (p *proxy) widenRequestingUnitAndForward(method, reqPath string, held []byt
 		return
 	}
 	p.publishUnitsAndForward(method, []string{unit}, fmt.Sprintf("requesting unit %s", unit), held)
-}
-
-// requestingPath extracts the requesting file's absolute path from a held
-// textDocument-scoped request (its raw JSON-RPC message).
-func requestingPath(raw []byte) string {
-	var m message
-	if json.Unmarshal(raw, &m) != nil {
-		return ""
-	}
-	return uriToPath(docURI(m.Params))
 }
 
 // awaitRequestUnit blocks until the requesting file's scope unit is applied
@@ -264,30 +252,34 @@ func (p *proxy) awaitRequestUnit(path string) bool {
 //
 // modRoot is the module owning the symbol whose implementation/references are
 // being queried. modRoot == "" (the main module) uses the persistent
-// whole-workspace worker as before. A nested modRoot cannot be served by that
-// worker at all — it only ever loads the main module — so that case falls
-// back to widening just the requesting file's own unit instead (the same
-// fallback resolveAndExpand uses for cross-module references); worktree-scoped
-// workers are a later step, not this one.
+// whole-workspace worker; a nested modRoot (e.g. a git worktree with its own
+// go.mod) uses its own per-module worker (workerFor), which loads only that
+// module — so it stays warm and cheap regardless of how large the main
+// workspace is.
 func (p *proxy) serveViaWorker(method, modRoot string, held []byte) {
-	if modRoot != "" {
-		p.log.Printf("crossref %s: whole-workspace query target is in nested module %s; the main worker cannot see it, widening the requesting unit instead", method, modRoot)
-		p.showMessage(messageWarning, fmt.Sprintf("gopls-lazy: %s results may be incomplete for module %s", method, modRoot))
-		p.widenRequestingUnitAndForward(method, requestingPath(held), held)
-		return
+	h := p.workerFor(modRoot)
+	if modRoot == "" {
+		p.log.Printf("crossref %s: isolated worker for method or implementation", method)
+	} else {
+		p.log.Printf("crossref %s: isolated worker for module %s", method, modRoot)
 	}
-	p.log.Printf("crossref %s: isolated worker for method or implementation", method)
 	var req message
 	if json.Unmarshal(held, &req) != nil || req.ID == nil {
 		p.toServer.write(held)
 		return
 	}
-	if p.worker.shouldWarnLoading() {
-		p.showMessage(messageInfo, "gopls-lazy: loading the whole workspace for implementation/references; the first query may take minutes")
+	if h.shouldWarnLoading() {
+		msg := "gopls-lazy: loading the whole workspace for implementation/references; the first query may take minutes"
+		if modRoot != "" {
+			msg = fmt.Sprintf("gopls-lazy: loading module %s for implementation/references; the first query may take minutes", modRoot)
+		}
+		p.showMessage(messageInfo, msg)
 	}
-	key := method + "\x00" + string(req.Params)
+	// modRoot is folded into the dedup key so an identical-looking request
+	// against a different module's worker is never coalesced with this one.
+	key := method + "\x00" + modRoot + "\x00" + string(req.Params)
 	v, err, shared := p.workerSF.Do(key, func() (any, error) {
-		return p.worker.request(held, p.opts.workerTimeout)
+		return h.request(held, p.opts.workerTimeout)
 	})
 	if err != nil {
 		p.handleWorkerError(method, req.ID, held, err)

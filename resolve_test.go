@@ -177,11 +177,13 @@ func TestResolveAndExpand_SameModuleNestedClosure_PrefixesUnits(t *testing.T) {
 	}
 }
 
-// TestServeViaWorker_NestedModuleRoot_FallsBackWithoutTouchingWorker verifies
-// that a whole-workspace query whose target is in a nested module never
-// calls p.worker (left nil here, so any call would panic) and instead
-// widens only the requesting file's own unit.
-func TestServeViaWorker_NestedModuleRoot_FallsBackWithoutTouchingWorker(t *testing.T) {
+// TestServeViaWorker_NestedModuleRoot_UsesPerModuleWorker verifies that a
+// whole-workspace query whose target is in a nested module is routed to that
+// module's OWN worker handle (via workerFor), never to p.worker (left nil
+// here, so any call to it would panic). p.opts.gopls is left empty, so the
+// per-module worker's process spawn fails immediately; serveViaWorker must
+// still forward the held request rather than hang or panic.
+func TestServeViaWorker_NestedModuleRoot_UsesPerModuleWorker(t *testing.T) {
 	p, buf := newTestProxy()
 	p.appliedFallbackDelay = 10 * time.Millisecond
 	root := t.TempDir()
@@ -227,8 +229,15 @@ func TestServeViaWorker_NestedModuleRoot_FallsBackWithoutTouchingWorker(t *testi
 		t.Fatal("serveViaWorker did not return")
 	}
 
+	p.subWorkersMu.Lock()
+	h, ok := p.subWorkers[modDir]
+	p.subWorkersMu.Unlock()
+	if !ok || h == nil {
+		t.Fatal("serveViaWorker did not route through a per-module worker handle for the nested module")
+	}
+
 	if !strings.Contains(buf.String(), `"method":"textDocument/implementation"`) {
-		t.Error("held implementation request not forwarded")
+		t.Error("held implementation request not forwarded after the per-module worker's spawn failed")
 	}
 }
 

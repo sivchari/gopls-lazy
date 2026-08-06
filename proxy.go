@@ -61,6 +61,9 @@ type proxy struct {
 	workerSF singleflight.Group // dedups concurrent identical isolated-worker requests
 	worker   *workerHandle      // persistent isolated gopls for whole-workspace queries
 
+	subWorkersMu sync.Mutex               // guards subWorkers only; kept separate from p.mu, matching subIdxMu
+	subWorkers   map[string]*workerHandle // nested module root -> its own isolated worker, built lazily via workerFor
+
 	idx      *revIndex
 	graph    *graphServer
 	modRoots *moduleRootCache // nested (e.g. worktree) go.mod detection for unitFor; nil is treated as "no nested modules"
@@ -120,9 +123,83 @@ func (p *proxy) run() int {
 	go func() { p.pumpServer(bufio.NewReaderSize(serverOut, 1<<20)); done <- struct{}{} }()
 	<-done
 	p.worker.shutdown("proxy exiting")
+	p.subWorkersMu.Lock()
+	subs := make([]*workerHandle, 0, len(p.subWorkers))
+	for _, h := range p.subWorkers {
+		subs = append(subs, h)
+	}
+	p.subWorkersMu.Unlock()
+	for _, h := range subs {
+		h.shutdown("proxy exiting")
+	}
 	_ = cmd.Process.Kill()
 	_ = cmd.Wait()
 	return 0
+}
+
+// workerFor returns the isolated worker handle responsible for modRoot: the
+// persistent main-workspace worker for "" (the main module), or a lazily
+// created, per-module handle for a nested module root (e.g. a git worktree
+// with its own go.mod). A second call for the same modRoot returns the same
+// handle. The returned handle is not started here — like the main worker, it
+// lazily spawns its gopls process on first ensureStarted/acquire/request.
+func (p *proxy) workerFor(modRoot string) *workerHandle {
+	if modRoot == "" {
+		return p.worker
+	}
+	p.subWorkersMu.Lock()
+	defer p.subWorkersMu.Unlock()
+	if p.subWorkers == nil {
+		p.subWorkers = map[string]*workerHandle{}
+	}
+	h, ok := p.subWorkers[modRoot]
+	if !ok {
+		h = &workerHandle{p: p, root: modRoot}
+		p.subWorkers[modRoot] = h
+	}
+	return h
+}
+
+// observeWorker mirrors an editor notification onto the isolated worker(s)
+// whose view it affects. A document-scoped notification (didOpen/didChange/
+// didClose and similar) is delivered only to the worker owning that
+// document's module, resolved via workerFor. A workspace-level notification
+// with no textDocument (didChangeConfiguration, didChangeWatchedFiles, ...)
+// has no single owning module, so it is broadcast to the main worker and
+// every ALREADY-CREATED sub-worker — never to a sub-worker that would have to
+// be lazily created just to receive it, since that would spin up an idle
+// worker for every module ever seen.
+func (p *proxy) observeWorker(method string, params json.RawMessage) {
+	uri := docURI(params)
+	if uri == "" {
+		p.broadcastObserve(method, params)
+		return
+	}
+	path := uriToPath(uri)
+	p.mu.Lock()
+	root := p.root
+	p.mu.Unlock()
+	var modRoot string
+	if path != "" && root != "" && p.modRoots != nil {
+		modRoot = p.modRoots.RootFor(filepath.Dir(path), root)
+	}
+	p.workerFor(modRoot).observe(method, params)
+}
+
+// broadcastObserve delivers a workspace-level notification to the main
+// worker and every sub-worker that already exists, without creating any new
+// ones.
+func (p *proxy) broadcastObserve(method string, params json.RawMessage) {
+	p.worker.observe(method, params)
+	p.subWorkersMu.Lock()
+	subs := make([]*workerHandle, 0, len(p.subWorkers))
+	for _, h := range p.subWorkers {
+		subs = append(subs, h)
+	}
+	p.subWorkersMu.Unlock()
+	for _, h := range subs {
+		h.observe(method, params)
+	}
 }
 
 // pumpClient forwards editor->gopls traffic, patching initialize options and
@@ -167,7 +244,7 @@ func (p *proxy) pumpClient(r *bufio.Reader) {
 				continue // config response: written to gopls in-order by the handler
 			}
 		}
-		p.worker.observe(m.Method, m.Params)
+		p.observeWorker(m.Method, m.Params)
 		p.toServer.write(raw)
 	}
 }
@@ -217,7 +294,9 @@ func (p *proxy) handleClientResponse(raw []byte, m *message) bool {
 	}
 	p.toServer.write(p.patchConfigResponse(raw, m))
 	p.advanceApplied(gen)
-	p.worker.observe("workspace/didChangeConfiguration", nil)
+	// Workspace-level: every worker's settings changed, not just the main
+	// one's, so broadcast rather than routing to a single module's worker.
+	p.broadcastObserve("workspace/didChangeConfiguration", nil)
 	return true
 }
 

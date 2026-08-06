@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -361,6 +362,204 @@ func TestWorkerHandle_ObserveBuffersWhileLoading(t *testing.T) {
 	h.mu.Unlock()
 	if got != 1 {
 		t.Errorf("observe buffered %d notes while loading, want 1", got)
+	}
+}
+
+// TestProxy_WorkerFor verifies workerFor's routing and lazy-creation
+// contract: "" always resolves to the main worker; a nested modRoot lazily
+// creates a dedicated, not-yet-started handle; and repeated calls for the
+// same modRoot return the same handle instance.
+func TestProxy_WorkerFor(t *testing.T) {
+	p := newTestWorkerProxy(0)
+	p.worker = &workerHandle{p: p}
+
+	if got := p.workerFor(""); got != p.worker {
+		t.Errorf("workerFor(\"\") = %p, want p.worker %p", got, p.worker)
+	}
+
+	const modRoot = "/repo/wt/nested"
+	h := p.workerFor(modRoot)
+	if h == nil {
+		t.Fatal("workerFor(modRoot) returned nil")
+	}
+	if h.root != modRoot {
+		t.Errorf("h.root = %q, want %q", h.root, modRoot)
+	}
+	if h.client != nil {
+		t.Error("workerFor must not eagerly start the worker process")
+	}
+	if h2 := p.workerFor(modRoot); h2 != h {
+		t.Error("a second workerFor(modRoot) call returned a different handle")
+	}
+}
+
+// TestProxy_WorkerStateFor_MainRoot pins workerStateFor's main-root snapshot
+// as byte-identical to the pre-per-module-worker workerState(): every open
+// doc unfiltered, the editor's own initialize params, and the config clone.
+// Both "" and the main root itself must produce this snapshot.
+func TestProxy_WorkerStateFor_MainRoot(t *testing.T) {
+	root := filepath.FromSlash("/repo")
+	docIn := openDoc{URI: pathToURI(filepath.Join(root, "a.go")), LanguageID: "go", Version: 1, Text: "package a\n"}
+	docNested := openDoc{URI: pathToURI(filepath.Join(root, "wt", "nested", "b.go")), LanguageID: "go", Version: 1, Text: "package b\n"}
+	p := &proxy{
+		root:         root,
+		openDocs:     map[string]openDoc{docIn.URI: docIn, docNested.URI: docNested},
+		workerInit:   json.RawMessage(`{"x":1}`),
+		workerConfig: []json.RawMessage{json.RawMessage(`{"y":2}`)},
+		log:          log.New(io.Discard, "", 0),
+	}
+
+	for _, r := range []string{root, ""} {
+		state := p.workerStateFor(r)
+		if state.root != root {
+			t.Errorf("workerStateFor(%q).root = %q, want %q", r, state.root, root)
+		}
+		// Every open doc, regardless of which module it lives under: the
+		// main worker mirrors the whole workspace.
+		if len(state.docs) != 2 {
+			t.Errorf("workerStateFor(%q) returned %d docs, want all 2 (unfiltered)", r, len(state.docs))
+		}
+		if string(state.initParams) != string(p.workerInit) {
+			t.Errorf("workerStateFor(%q).initParams = %s, want the editor's own %s", r, state.initParams, p.workerInit)
+		}
+		if len(state.config) != 1 || string(state.config[0]) != string(p.workerConfig[0]) {
+			t.Errorf("workerStateFor(%q).config = %v, want %v", r, state.config, p.workerConfig)
+		}
+	}
+}
+
+// TestProxy_WorkerStateFor_NestedRoot verifies a nested module's snapshot:
+// no initialize params (so workerClient.initialize falls back to
+// defaultInitializeParams(root)), only the docs open under that module, and
+// the same config clone the main worker gets.
+func TestProxy_WorkerStateFor_NestedRoot(t *testing.T) {
+	root := filepath.FromSlash("/repo")
+	modRoot := filepath.Join(root, "wt", "nested")
+	docMain := openDoc{URI: pathToURI(filepath.Join(root, "a.go")), Version: 1, Text: "package a\n"}
+	docNested := openDoc{URI: pathToURI(filepath.Join(modRoot, "b.go")), Version: 1, Text: "package b\n"}
+	p := &proxy{
+		root:         root,
+		openDocs:     map[string]openDoc{docMain.URI: docMain, docNested.URI: docNested},
+		workerInit:   json.RawMessage(`{"x":1}`),
+		workerConfig: []json.RawMessage{json.RawMessage(`{"y":2}`)},
+		log:          log.New(io.Discard, "", 0),
+	}
+
+	state := p.workerStateFor(modRoot)
+	if state.root != modRoot {
+		t.Errorf("workerStateFor(nested).root = %q, want %q", state.root, modRoot)
+	}
+	if len(state.initParams) != 0 {
+		t.Errorf("workerStateFor(nested).initParams = %s, want empty so the defaultInitializeParams(root) fallback kicks in", state.initParams)
+	}
+	if len(state.docs) != 1 || state.docs[0].URI != docNested.URI {
+		t.Errorf("workerStateFor(nested).docs = %+v, want only %s", state.docs, docNested.URI)
+	}
+	if len(state.config) != 1 || string(state.config[0]) != string(p.workerConfig[0]) {
+		t.Errorf("workerStateFor(nested).config = %v, want %v", state.config, p.workerConfig)
+	}
+}
+
+// TestProxy_ObserveWorker_DocScopedRoutesToOwningModule verifies that a
+// doc-scoped notification (e.g. didOpen) for a file under a nested module is
+// delivered to exactly that module's worker handle and does not reach the
+// main worker or an unrelated sub-worker.
+func TestProxy_ObserveWorker_DocScopedRoutesToOwningModule(t *testing.T) {
+	root := t.TempDir()
+	modDir := filepath.Join(root, "wt", "nested")
+	writeGoMod(t, modDir)
+	filePath := filepath.Join(modDir, "pkg", "a.go")
+	mustMkdirAll(t, filepath.Dir(filePath))
+	mustWriteFile(t, filePath, "package pkg\n")
+
+	otherModDir := filepath.Join(root, "wt", "other")
+	writeGoMod(t, otherModDir)
+
+	p := &proxy{
+		root:     root,
+		modRoots: &moduleRootCache{},
+		log:      log.New(io.Discard, "", 0),
+	}
+	p.worker = &workerHandle{p: p, client: &workerClient{}} // live but readyDone=false: observe buffers
+	nestedHandle := &workerHandle{p: p, root: modDir, client: &workerClient{}}
+	otherHandle := &workerHandle{p: p, root: otherModDir, client: &workerClient{}}
+	p.subWorkers = map[string]*workerHandle{modDir: nestedHandle, otherModDir: otherHandle}
+
+	params, err := json.Marshal(struct {
+		TextDocument textDocumentIdentifier `json:"textDocument"`
+	}{TextDocument: textDocumentIdentifier{URI: pathToURI(filePath)}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.observeWorker(methodDidOpen, params)
+
+	p.worker.mu.Lock()
+	mainBuffered := len(p.worker.pendingObs)
+	p.worker.mu.Unlock()
+	if mainBuffered != 0 {
+		t.Errorf("doc-scoped notify for a nested-module file reached the main worker (%d buffered)", mainBuffered)
+	}
+	otherHandle.mu.Lock()
+	otherBuffered := len(otherHandle.pendingObs)
+	otherHandle.mu.Unlock()
+	if otherBuffered != 0 {
+		t.Errorf("doc-scoped notify reached an unrelated module's worker (%d buffered)", otherBuffered)
+	}
+	nestedHandle.mu.Lock()
+	nestedBuffered := len(nestedHandle.pendingObs)
+	nestedHandle.mu.Unlock()
+	if nestedBuffered != 1 {
+		t.Errorf("doc-scoped notify buffered %d notes on the owning module's worker, want 1", nestedBuffered)
+	}
+}
+
+// TestProxy_ObserveWorker_BroadcastOnlyReachesExistingHandles verifies that a
+// URI-less (workspace-level) notification is broadcast to the main worker and
+// every ALREADY-CREATED sub-worker, and never lazily creates a new one just
+// to receive it.
+func TestProxy_ObserveWorker_BroadcastOnlyReachesExistingHandles(t *testing.T) {
+	p := &proxy{log: log.New(io.Discard, "", 0)}
+	p.worker = &workerHandle{p: p, client: &workerClient{}}
+
+	// No sub-workers yet: the broadcast must reach only the main worker and
+	// must not populate subWorkers.
+	p.observeWorker("workspace/didChangeConfiguration", json.RawMessage(`{}`))
+	p.worker.mu.Lock()
+	mainBuffered := len(p.worker.pendingObs)
+	p.worker.mu.Unlock()
+	if mainBuffered != 1 {
+		t.Errorf("main worker buffered %d notes, want 1", mainBuffered)
+	}
+	p.subWorkersMu.Lock()
+	n := len(p.subWorkers)
+	p.subWorkersMu.Unlock()
+	if n != 0 {
+		t.Errorf("broadcast lazily created %d subWorkers entries, want 0", n)
+	}
+
+	// Pre-seed two sub-workers: a second broadcast must reach both of them
+	// too, in addition to the main worker.
+	h1 := &workerHandle{p: p, root: "/repo/wt/a", client: &workerClient{}}
+	h2 := &workerHandle{p: p, root: "/repo/wt/b", client: &workerClient{}}
+	p.subWorkersMu.Lock()
+	p.subWorkers = map[string]*workerHandle{"/repo/wt/a": h1, "/repo/wt/b": h2}
+	p.subWorkersMu.Unlock()
+
+	p.observeWorker("workspace/didChangeConfiguration", json.RawMessage(`{}`))
+
+	p.worker.mu.Lock()
+	mainBuffered = len(p.worker.pendingObs)
+	p.worker.mu.Unlock()
+	if mainBuffered != 2 {
+		t.Errorf("main worker buffered %d notes after two broadcasts, want 2", mainBuffered)
+	}
+	for name, h := range map[string]*workerHandle{"a": h1, "b": h2} {
+		h.mu.Lock()
+		got := len(h.pendingObs)
+		h.mu.Unlock()
+		if got != 1 {
+			t.Errorf("sub-worker %s buffered %d notes, want 1", name, got)
+		}
 	}
 }
 
