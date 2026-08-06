@@ -40,9 +40,20 @@ type graphServer struct {
 	cacheFile string // path to the on-disk graph file; empty if no root yet
 	ln        net.Listener
 
-	mu   sync.Mutex
-	root string // workspace root, for the startup freshness check
-	main graphSlot
+	// modRoots detects which nested module (e.g. a git worktree with its own
+	// go.mod) a query's directory belongs to, so it can be routed to that
+	// module's own subslot instead of the main one. indexFor returns the
+	// reverse-import index owning a module root, used by a subslot's
+	// overlayDirty check. Both nil (a graphServer built directly, e.g. by an
+	// existing test) means "no nested modules": every query is answered from
+	// the main slot, exactly as before subslots existed.
+	modRoots *moduleRootCache
+	indexFor func(string) *revIndex
+
+	mu       sync.Mutex
+	root     string // workspace root, for the startup freshness check
+	main     graphSlot
+	subslots map[string]*graphSlot // nested module root -> its own in-memory-only slot, built lazily via subslotFor
 }
 
 // graphSlot holds the mutable, per-workspace go/packages driver cache: the
@@ -136,14 +147,16 @@ type driverQuery struct {
 // startGraphServer starts the GOPACKAGESDRIVER unix socket server.
 // Call setRoot once the workspace root is known (on initialize) so the
 // on-disk cache can be located and loaded before the first driver query.
-func startGraphServer(idx *revIndex, logger *log.Logger) (*graphServer, error) {
+// modRoots and indexFor wire up per-module subslot dispatch (see
+// graphServer.answer); either may be nil, meaning no nested modules.
+func startGraphServer(idx *revIndex, modRoots *moduleRootCache, indexFor func(string) *revIndex, logger *log.Logger) (*graphServer, error) {
 	sock := filepath.Join(os.TempDir(), fmt.Sprintf("gopls-lazy-%d.sock", os.Getpid()))
 	_ = os.Remove(sock)
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
 		return nil, err
 	}
-	g := &graphServer{idx: idx, log: logger, sockPath: sock, ln: ln}
+	g := &graphServer{idx: idx, modRoots: modRoots, indexFor: indexFor, log: logger, sockPath: sock, ln: ln}
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -360,16 +373,17 @@ func (g *graphServer) setEmbedFromResp(resp []byte) {
 	g.storeEmbed(files, prefixSet)
 }
 
-// setEmbedFromPackages records the same footprint directly from the loaded
-// packages, so a fresh build does not re-decode the multi-MB response it just
-// produced.
-func (g *graphServer) setEmbedFromPackages(pkgs []*packages.Package) {
+// setEmbedFromPackagesSlot records a slot's //go:embed footprint directly
+// from the loaded packages, so a fresh build does not re-decode the
+// multi-MB response it just produced. Parameterized by slot so a subslot's
+// build also records its own footprint, not the main slot's.
+func (g *graphServer) setEmbedFromPackagesSlot(slot *graphSlot, pkgs []*packages.Package) {
 	files := make(map[string]bool)
 	prefixSet := make(map[string]bool)
 	for _, p := range pkgs {
 		addEmbed(files, prefixSet, p.GoFiles, p.EmbedFiles, p.EmbedPatterns)
 	}
-	g.storeEmbed(files, prefixSet)
+	g.storeEmbedSlot(slot, files, prefixSet)
 }
 
 // addEmbed folds one package's embed footprint into the accumulating sets: the
@@ -391,15 +405,21 @@ func addEmbed(files, prefixSet map[string]bool, goFiles, embedFiles, embedPatter
 	}
 }
 
+// storeEmbed publishes the main slot's embed footprint. Thin wrapper over
+// storeEmbedSlot, kept so setEmbedFromResp's call site is unchanged.
 func (g *graphServer) storeEmbed(files, prefixSet map[string]bool) {
+	g.storeEmbedSlot(&g.main, files, prefixSet)
+}
+
+func (g *graphServer) storeEmbedSlot(slot *graphSlot, files, prefixSet map[string]bool) {
 	prefixes := make([]string, 0, len(prefixSet))
 	for p := range prefixSet {
 		prefixes = append(prefixes, p)
 	}
 	g.mu.Lock()
-	g.main.embedFiles = files
-	g.main.embedPrefixes = prefixes
-	g.main.embedReady = true
+	slot.embedFiles = files
+	slot.embedPrefixes = prefixes
+	slot.embedReady = true
 	g.mu.Unlock()
 }
 
@@ -492,6 +512,14 @@ func (g *graphServer) handle(conn net.Conn) {
 
 var notHandled = []byte(`{"NotHandled":true}`)
 
+// answer dispatches a driver query to the slot owning its directory: the
+// main workspace slot, or a nested module's own subslot (e.g. a git
+// worktree with its own go.mod). The dispatch runs BEFORE any cache-hit
+// check, which matters: dirCompatible alone is a string-prefix test, so a
+// nested module's Dir would otherwise wrongly prefix-match the main slot's
+// cached dir (which, right after startup, is often the workspace root
+// itself — every subdirectory string-prefix-matches that) and be served the
+// wrong, main-workspace graph.
 func (g *graphServer) answer(q driverQuery) []byte {
 	var req packages.DriverRequest
 	if err := json.Unmarshal(q.Request, &req); err != nil {
@@ -499,22 +527,77 @@ func (g *graphServer) answer(q driverQuery) []byte {
 	}
 	key := strings.Join(q.Patterns, "\x00")
 
+	modRoot := g.resolveModRoot(q.Dir)
+	if modRoot == "" {
+		return g.answerSlot(&g.main, g.idx, q, req, key, true)
+	}
+	slot, idx := g.subslotFor(modRoot)
+	return g.answerSlot(slot, idx, q, req, key, false)
+}
+
+// resolveModRoot resolves which module owns a driver query's directory: ""
+// for the main module, or a nested module's own root otherwise. Defensive:
+// a graphServer with no modRoots wiring (e.g. one built directly by an
+// existing test) or a query with no usable Dir always resolves to the main
+// module, matching answer's pre-subslot behavior byte-for-byte.
+func (g *graphServer) resolveModRoot(dir string) string {
+	if g.modRoots == nil || dir == "" {
+		return ""
+	}
 	g.mu.Lock()
-	resp := g.main.resp
-	stale := g.main.stale
-	hasCache := resp != nil && key == g.main.patternsKey
+	root := g.root
+	g.mu.Unlock()
+	if root == "" {
+		return ""
+	}
+	return g.modRoots.RootFor(dir, root)
+}
+
+// subslotFor returns the lazily-created subslot and owning-module index for
+// a nested module root. A second call for the same modRoot returns the same
+// slot.
+func (g *graphServer) subslotFor(modRoot string) (*graphSlot, *revIndex) {
+	g.mu.Lock()
+	if g.subslots == nil {
+		g.subslots = map[string]*graphSlot{}
+	}
+	slot, ok := g.subslots[modRoot]
+	if !ok {
+		slot = &graphSlot{}
+		g.subslots[modRoot] = slot
+	}
+	g.mu.Unlock()
+	var idx *revIndex
+	if g.indexFor != nil {
+		idx = g.indexFor(modRoot)
+	}
+	return slot, idx
+}
+
+// answerSlot runs the cache-hit/miss, dir-mismatch, staleness and
+// overlay-dirty dispatch logic against one slot. idx is the reverse-import
+// index used by overlayDirty to check unsaved-overlay import changes; it may
+// be nil (see overlayDirty). persist controls whether a build triggered from
+// this slot also writes the on-disk cache: true for the main slot only — a
+// subslot's disk-cache key (the git common dir) is shared with the main
+// slot's, so writing there would corrupt it.
+func (g *graphServer) answerSlot(slot *graphSlot, idx *revIndex, q driverQuery, req packages.DriverRequest, key string, persist bool) []byte {
+	g.mu.Lock()
+	resp := slot.resp
+	stale := slot.stale
+	hasCache := resp != nil && key == slot.patternsKey
 
 	// A query from outside the cached dir targets another checkout; the cached
 	// absolute paths would be wrong there. Fall back to go list and rebuild for
 	// the queried dir so serving resumes from the right root.
-	if hasCache && !dirCompatible(q.Dir, g.main.dir) {
-		if isWorkspaceQuery(q.Patterns) && !g.main.building {
-			g.main.building = true
+	if hasCache && !dirCompatible(q.Dir, slot.dir) {
+		if isWorkspaceQuery(q.Patterns) && !slot.building {
+			slot.building = true
 			patterns := append([]string(nil), q.Patterns...)
 			dir := q.Dir
-			go g.build(patterns, dir, key)
+			go g.buildSlot(slot, patterns, dir, key, persist)
 		}
-		cached := g.main.dir
+		cached := slot.dir
 		g.mu.Unlock()
 		g.log.Printf("driver: NotHandled (query dir %s does not match cached dir %s)", q.Dir, cached)
 		return notHandled
@@ -523,11 +606,11 @@ func (g *graphServer) answer(q driverQuery) []byte {
 	if !hasCache {
 		// No cache at all: trigger a background build for workspace queries
 		// and tell gopls to fall back to the real go list.
-		if isWorkspaceQuery(q.Patterns) && !g.main.building {
-			g.main.building = true
+		if isWorkspaceQuery(q.Patterns) && !slot.building {
+			slot.building = true
 			patterns := append([]string(nil), q.Patterns...)
 			dir := q.Dir
-			go g.build(patterns, dir, key)
+			go g.buildSlot(slot, patterns, dir, key, persist)
 		}
 		g.mu.Unlock()
 		g.log.Printf("driver: NotHandled (no cache, patterns=%v)", q.Patterns)
@@ -537,17 +620,17 @@ func (g *graphServer) answer(q driverQuery) []byte {
 	// We have a cache. If it is stale (go.mod / imports changed on disk),
 	// kick off a background rebuild but still serve the cached data so
 	// re-scopes during the ~13s rebuild window don't regress to full go list.
-	if stale && !g.main.building {
-		g.main.building = true
-		patterns, dir := g.main.patterns, g.main.dir
-		go g.build(patterns, dir, key)
+	if stale && !slot.building {
+		slot.building = true
+		patterns, dir := slot.patterns, slot.dir
+		go g.buildSlot(slot, patterns, dir, key, persist)
 	}
 	g.mu.Unlock()
 
 	// Only fall back for live import changes the user has in an unsaved
 	// overlay — those modify the package graph in a way the cached snapshot
 	// cannot reflect.
-	if g.overlayDirty(req.Overlay) {
+	if g.overlayDirty(idx, req.Overlay) {
 		g.log.Printf("driver: overlay changes imports, falling back to go list")
 		return notHandled
 	}
@@ -583,7 +666,18 @@ func isWorkspaceQuery(patterns []string) bool {
 	return false
 }
 
+// build runs `go list` for patterns/dir and populates the main slot with the
+// result, persisting it to the on-disk cache. Thin wrapper kept for its
+// existing callers (loadDiskCache, MarkStale); see buildSlot for the
+// slot-parameterized logic subslots also use.
 func (g *graphServer) build(patterns []string, dir, key string) {
+	g.buildSlot(&g.main, patterns, dir, key, true)
+}
+
+// buildSlot runs `go list` for patterns/dir and populates slot with the
+// result. persist controls whether the build is also written to the on-disk
+// cache (main slot only, see answerSlot).
+func (g *graphServer) buildSlot(slot *graphSlot, patterns []string, dir, key string, persist bool) {
 	start := time.Now()
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
@@ -598,7 +692,7 @@ func (g *graphServer) build(patterns []string, dir, key string) {
 	if err != nil {
 		g.log.Printf("driver: build failed: %v", err)
 		g.mu.Lock()
-		g.main.building = false
+		slot.building = false
 		g.mu.Unlock()
 		return
 	}
@@ -622,63 +716,95 @@ func (g *graphServer) build(patterns []string, dir, key string) {
 	if err != nil {
 		g.log.Printf("driver: marshal failed: %v", err)
 		g.mu.Lock()
-		g.main.building = false
+		slot.building = false
 		g.mu.Unlock()
 		return
 	}
 	g.mu.Lock()
-	g.main.resp = b
-	g.main.patterns = patterns
-	g.main.patternsKey = key
-	g.main.dir = dir
-	g.main.stale = false
-	g.main.building = false
+	slot.resp = b
+	slot.patterns = patterns
+	slot.patternsKey = key
+	slot.dir = dir
+	slot.stale = false
+	slot.building = false
 	g.mu.Unlock()
-	g.setEmbedFromPackages(all)
+	g.setEmbedFromPackagesSlot(slot, all)
 	g.log.Printf("driver: graph built in %s (%d packages, %d roots, %dMB)",
 		time.Since(start).Round(time.Millisecond), len(all), len(rootIDs), len(b)>>20)
-	go g.saveDiskCache(b, key, patterns, dir)
+	if persist {
+		go g.saveDiskCache(b, key, patterns, dir)
+	}
 }
 
 // overlayDirty reports whether any open-file overlay changes a file's import
-// set compared to the on-disk state the cache was built from.
-func (g *graphServer) overlayDirty(overlay map[string][]byte) bool {
+// set compared to the on-disk state the cache was built from, per idx (the
+// reverse-import index owning the slot being checked). A nil idx (no index
+// wired for this slot, e.g. a nested module whose index has not been built)
+// is conservative: any non-empty overlay is treated as dirty.
+func (g *graphServer) overlayDirty(idx *revIndex, overlay map[string][]byte) bool {
 	for path, content := range overlay {
 		if !strings.HasSuffix(path, ".go") {
 			return true
 		}
-		if !g.idx.SameImports(path, content) {
+		if idx == nil || !idx.SameImports(path, content) {
 			return true
 		}
 	}
 	return false
 }
 
-// MarkStale schedules a background rebuild; until it finishes, queries fall
-// back to the real go list.
+// MarkStale schedules a background rebuild of the main slot; until it
+// finishes, queries fall back to the real go list.
 func (g *graphServer) MarkStale(reason string) {
+	g.markSlotStale(&g.main, reason, true)
+}
+
+// MarkStaleFor marks stale the slot owning path's module: the main
+// workspace slot when path is not under any nested module, or that
+// module's own subslot otherwise. Unlike MarkStale, it never creates a
+// subslot that does not already exist — a module nothing has ever been
+// built for has no cache to invalidate.
+func (g *graphServer) MarkStaleFor(path, reason string) {
+	modRoot := g.resolveModRoot(filepath.Dir(path))
+	if modRoot == "" {
+		g.MarkStale(reason)
+		return
+	}
+	g.mu.Lock()
+	slot := g.subslots[modRoot]
+	g.mu.Unlock()
+	if slot == nil {
+		return
+	}
+	g.markSlotStale(slot, reason, false)
+}
+
+// markSlotStale is the shared MarkStale/MarkStaleFor implementation,
+// parameterized by slot and by whether a triggered rebuild persists to the
+// on-disk cache (main slot only, see answerSlot).
+func (g *graphServer) markSlotStale(slot *graphSlot, reason string, persist bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.main.patternsKey == "" {
+	if slot.patternsKey == "" {
 		return // never built; nothing to refresh
 	}
-	if !g.main.stale {
+	if !slot.stale {
 		g.log.Printf("driver: cache marked stale (%s)", reason)
 	}
-	g.main.stale = true
-	if g.main.rebuildTimer != nil {
-		g.main.rebuildTimer.Stop()
+	slot.stale = true
+	if slot.rebuildTimer != nil {
+		slot.rebuildTimer.Stop()
 	}
-	g.main.rebuildTimer = time.AfterFunc(3*time.Second, func() {
+	slot.rebuildTimer = time.AfterFunc(3*time.Second, func() {
 		g.mu.Lock()
-		if g.main.building {
+		if slot.building {
 			g.mu.Unlock()
 			return
 		}
-		g.main.building = true
-		patterns, dir, key := g.main.patterns, g.main.dir, g.main.patternsKey
+		slot.building = true
+		patterns, dir, key := slot.patterns, slot.dir, slot.patternsKey
 		g.mu.Unlock()
-		g.build(patterns, dir, key)
+		g.buildSlot(slot, patterns, dir, key, persist)
 	})
 }
 

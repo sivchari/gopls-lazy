@@ -81,7 +81,7 @@ func (p *proxy) run() int {
 	cmd := exec.Command(p.opts.gopls, args...) //nolint:gosec // gopls path comes from user configuration, not untrusted input
 	cmd.Env = os.Environ()
 	if p.opts.driver {
-		g, err := startGraphServer(p.idx, p.log)
+		g, err := startGraphServer(p.idx, p.modRoots, p.indexFor, p.log)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gopls-lazy: graph server: %v (continuing without driver)\n", err)
 		} else {
@@ -907,7 +907,7 @@ func (p *proxy) observeFileEvent(uri string) {
 		// JSON, editor temp files) would fire a full `go list ./...` rebuild on
 		// noise and starve type-checking, so check the embed footprint first.
 		if p.graph != nil && p.graph.IsEmbedFile(path) {
-			p.graph.MarkStale("embedded asset changed: " + base)
+			p.graph.MarkStaleFor(path, "embedded asset changed: "+base)
 		}
 		return
 	}
@@ -926,7 +926,7 @@ func (p *proxy) handleModuleFileEvent(path, base string) bool {
 		p.invalidateModuleBoundary(path)
 	}
 	if p.graph != nil {
-		p.graph.MarkStale("module file changed: " + base)
+		p.graph.MarkStaleFor(path, "module file changed: "+base)
 	}
 	return true
 }
@@ -942,7 +942,7 @@ func (p *proxy) updateFileInIndex(path, root string) {
 	}
 	changed := p.indexFor(modRoot).UpdateFile(path)
 	if changed && p.graph != nil {
-		p.graph.MarkStale("imports or embed directives changed: " + path)
+		p.graph.MarkStaleFor(path, "imports or embed directives changed: "+path)
 	}
 }
 

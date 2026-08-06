@@ -395,3 +395,175 @@ func TestGraphServer_IsEmbedFile(t *testing.T) {
 		})
 	}
 }
+
+// TestGraphServer_Answer_SubslotDispatch_NeverServedFromMainCache is the
+// CRITICAL regression pin: a query whose Dir is under a nested module's
+// go.mod must never be served from the main slot's cache, even though
+// dirCompatible's pure string-prefix check would wrongly allow it here (the
+// main slot's cached dir is the workspace root itself, and every
+// subdirectory string-prefix-matches that). The modRoot dispatch at the very
+// top of answer(), run BEFORE any hasCache/dirCompatible check, is what
+// prevents this; this test would fail if that dispatch were removed or
+// reordered after the dirCompatible check.
+func TestGraphServer_Answer_SubslotDispatch_NeverServedFromMainCache(t *testing.T) {
+	root := t.TempDir()
+	modDir := filepath.Join(root, "wt", "nested")
+	writeGoMod(t, modDir)
+
+	if !dirCompatible(modDir, root) {
+		t.Fatal("test setup invalid: dirCompatible must consider modDir compatible with the main dir for this regression pin to be meaningful")
+	}
+
+	g := &graphServer{
+		log:      log.New(io.Discard, "", 0),
+		root:     root,
+		modRoots: &moduleRootCache{},
+		main: graphSlot{
+			resp:        []byte(`{"Packages":[{"GoFiles":["` + root + `/pkg/a.go"]}]}`),
+			patternsKey: "./...",
+			patterns:    []string{"./..."},
+			dir:         root,
+		},
+	}
+
+	got := g.answer(driverQuery{Patterns: []string{"./..."}, Dir: modDir, Request: json.RawMessage(`{}`)})
+	if !bytes.Equal(got, notHandled) {
+		t.Errorf("answer(nested module dir) = %s, want NotHandled (must not be served from the main slot's cache)", got)
+	}
+
+	g.mu.Lock()
+	_, gotSubslot := g.subslots[modDir]
+	mainDirUnchanged := g.main.dir == root
+	g.mu.Unlock()
+	if !gotSubslot {
+		t.Error("answer did not dispatch the nested-module query to its own subslot")
+	}
+	if !mainDirUnchanged {
+		t.Error("answer mutated the main slot while serving a nested-module query")
+	}
+}
+
+// TestGraphServer_Answer_MainDirQuery_StillServedFromMainSlot verifies the
+// dispatch's other half: a query whose Dir belongs to the main module (not
+// under any nested module's go.mod) is unaffected by subslot dispatch and
+// keeps being served from the main slot exactly as before.
+func TestGraphServer_Answer_MainDirQuery_StillServedFromMainSlot(t *testing.T) {
+	root := t.TempDir()
+	writeGoMod(t, filepath.Join(root, "wt", "nested")) // a nested module exists elsewhere, but is irrelevant here
+
+	g := &graphServer{
+		log:      log.New(io.Discard, "", 0),
+		root:     root,
+		modRoots: &moduleRootCache{},
+		main: graphSlot{
+			resp:        []byte(`{"Packages":[{"GoFiles":["` + root + `/pkg/a.go"]}]}`),
+			patternsKey: "./...",
+			patterns:    []string{"./..."},
+			dir:         root,
+		},
+	}
+
+	got := g.answer(driverQuery{Patterns: []string{"./..."}, Dir: root, Request: json.RawMessage(`{}`)})
+	if bytes.Equal(got, notHandled) {
+		t.Error("answer(main root dir) should serve the main slot's cache, got NotHandled")
+	}
+	g.mu.Lock()
+	n := len(g.subslots)
+	g.mu.Unlock()
+	if n != 0 {
+		t.Errorf("answer(main root dir) created %d subslots, want 0", n)
+	}
+}
+
+// TestGraphServer_BuildSlot_SubslotSkipsDiskCache verifies that a subslot
+// build (persist=false, the only way answer dispatches a nested module's
+// build) never writes the on-disk cache — that cache's key is the git common
+// dir, shared with the main slot, so a subslot write would corrupt it.
+func TestGraphServer_BuildSlot_SubslotSkipsDiskCache(t *testing.T) {
+	dir := t.TempDir()
+	writeGoMod(t, dir)
+	mustWriteFile(t, filepath.Join(dir, "a.go"), "package x\n")
+
+	cacheFile := filepath.Join(t.TempDir(), "graph.json")
+	g := &graphServer{log: log.New(io.Discard, "", 0), cacheFile: cacheFile}
+
+	slot := &graphSlot{}
+	g.buildSlot(slot, []string{"./..."}, dir, "./...", false)
+
+	g.mu.Lock()
+	resp := slot.resp
+	g.mu.Unlock()
+	if len(resp) == 0 {
+		t.Fatal("buildSlot did not populate the subslot")
+	}
+	if _, err := os.Stat(cacheFile); !os.IsNotExist(err) {
+		t.Errorf("buildSlot(persist=false) wrote a disk cache file at %s, want none", cacheFile)
+	}
+}
+
+// TestGraphServer_MarkStaleFor_RoutesToOwningSlot verifies that
+// MarkStaleFor marks stale only the slot owning path's module: a nested
+// module's go.mod change must not touch the main slot's staleness, and vice
+// versa.
+func TestGraphServer_MarkStaleFor_RoutesToOwningSlot(t *testing.T) {
+	root := t.TempDir()
+	modDir := filepath.Join(root, "wt", "nested")
+	writeGoMod(t, modDir)
+
+	g := &graphServer{
+		log:      log.New(io.Discard, "", 0),
+		root:     root,
+		modRoots: &moduleRootCache{},
+		main:     graphSlot{patternsKey: "./...", patterns: []string{"./..."}, dir: root},
+	}
+	sub := &graphSlot{patternsKey: "./...", patterns: []string{"./..."}, dir: modDir}
+	g.subslots = map[string]*graphSlot{modDir: sub}
+
+	g.MarkStaleFor(filepath.Join(modDir, "go.mod"), "module file changed: go.mod")
+	g.mu.Lock()
+	subStale, mainStale := sub.stale, g.main.stale
+	g.mu.Unlock()
+	if !subStale {
+		t.Error("MarkStaleFor(nested path) did not mark the owning subslot stale")
+	}
+	if mainStale {
+		t.Error("MarkStaleFor(nested path) incorrectly marked the main slot stale")
+	}
+
+	g.MarkStaleFor(filepath.Join(root, "go.mod"), "module file changed: go.mod")
+	g.mu.Lock()
+	mainStale = g.main.stale
+	g.mu.Unlock()
+	if !mainStale {
+		t.Error("MarkStaleFor(main-module path) did not mark the main slot stale")
+	}
+}
+
+// TestGraphServer_MarkStaleFor_NoExistingSubslotIsNoop verifies that
+// MarkStaleFor never lazily creates a subslot just to mark it stale: with
+// nothing ever built for a module, there is no cache to invalidate.
+func TestGraphServer_MarkStaleFor_NoExistingSubslotIsNoop(t *testing.T) {
+	root := t.TempDir()
+	modDir := filepath.Join(root, "wt", "nested")
+	writeGoMod(t, modDir)
+
+	g := &graphServer{
+		log:      log.New(io.Discard, "", 0),
+		root:     root,
+		modRoots: &moduleRootCache{},
+		main:     graphSlot{patternsKey: "./...", patterns: []string{"./..."}, dir: root},
+	}
+
+	g.MarkStaleFor(filepath.Join(modDir, "go.mod"), "module file changed: go.mod")
+
+	g.mu.Lock()
+	_, created := g.subslots[modDir]
+	mainStale := g.main.stale
+	g.mu.Unlock()
+	if created {
+		t.Error("MarkStaleFor lazily created a subslot with nothing to invalidate")
+	}
+	if mainStale {
+		t.Error("MarkStaleFor(nested path, no existing subslot) incorrectly marked the main slot stale")
+	}
+}
