@@ -30,9 +30,10 @@ type repoLocs struct {
 	memFile    string      // lib/memstore/memstore.go
 	memGetDecl lspPosition // "Get" in "func (m *Mem) Get(key string) string"
 
-	svcFiles  []string // all svcCount services/svcNN/svc.go files
-	svc00File string
-	svc17File string
+	svcFiles     []string // all svcCount services/svcNN/svc.go files
+	svc00File    string
+	svc17File    string
+	svc17SumCall lspPosition // "Sum" in the util.Sum call inside svc17
 }
 
 // writeMonorepo writes a single-module synthetic monorepo into a temp dir:
@@ -119,6 +120,7 @@ func Handle(s iface.Store) string {
 			locs.getCall = mustPos(t, src, "s.Get(", "Get")
 		case 17:
 			locs.svc17File = path
+			locs.svc17SumCall = mustPos(t, src, "util.Sum(", "Sum")
 		}
 	}
 

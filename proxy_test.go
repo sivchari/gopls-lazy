@@ -433,6 +433,103 @@ func TestInterceptDefinition(t *testing.T) {
 	}
 }
 
+// TestInterceptInlayHint mirrors TestInterceptDefinition: inlayHint (and
+// hover, routed the same way) must hold while the requesting file's unit is
+// pending and forward inline once it is already applied. Unlike definition,
+// unforwardable/peek cases are not exercised here since inlayHint has no
+// "peek on a never-opened file" use case in editors.
+func TestInterceptInlayHint(t *testing.T) {
+	const uri = "file:///ws/go/services/auth/handler.go"
+	const unit = "go/services/auth"
+	tests := []struct {
+		name       string
+		entry      *scopeEntry
+		appliedGen int
+		wantHold   bool
+	}{
+		{name: "unit applied forwards inline", entry: &scopeEntry{gen: 1}, appliedGen: 1, wantHold: false},
+		{name: "unit published but not applied holds", entry: &scopeEntry{gen: 2}, appliedGen: 1, wantHold: true},
+		{name: "unit unpublished holds", entry: &scopeEntry{gen: 0}, appliedGen: 1, wantHold: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p, buf := newTestProxy()
+			p.root = "/ws"
+			p.appliedGen = tt.appliedGen
+			tt.entry.open = map[string]bool{}
+			p.scope[unit] = tt.entry
+			raw := []byte(`{"jsonrpc":"2.0","id":9,"method":"textDocument/inlayHint",` +
+				`"params":{"textDocument":{"uri":"` + uri + `"},"range":{"start":{"line":0,"character":0},"end":{"line":10,"character":0}}}}`)
+			var m message
+			if err := json.Unmarshal(raw, &m); err != nil {
+				t.Fatal(err)
+			}
+
+			got := p.interceptClientRequest(raw, &m)
+
+			if got != tt.wantHold {
+				t.Fatalf("interceptClientRequest() = %v, want %v", got, tt.wantHold)
+			}
+			if !tt.wantHold {
+				if buf.String() != "" {
+					t.Errorf("unheld inlayHint must be forwarded inline by pumpClient, not by interceptClientRequest; wrote %q", buf.String())
+				}
+				return
+			}
+			// Nothing may be forwarded while the unit is pending.
+			if strings.Contains(buf.String(), "textDocument/inlayHint") {
+				t.Fatal("held inlayHint forwarded before the unit was applied")
+			}
+			// Applying the unit's generation must release the held request.
+			p.mu.Lock()
+			p.scope[unit].gen = 2 // no-op unless the entry was unpublished
+			p.advanceAppliedLocked(2)
+			p.mu.Unlock()
+			waitFor(t, 2*time.Second, "held inlayHint released", func() bool {
+				return strings.Contains(buf.String(), "textDocument/inlayHint")
+			})
+		})
+	}
+}
+
+// TestReleaseHeldInlayHintOnDidChange mirrors TestReleaseHeldDefsOnDidChange:
+// a held inlayHint must be released by a didChange for the same document,
+// without waiting for the unit to be applied, and written exactly once.
+func TestReleaseHeldInlayHintOnDidChange(t *testing.T) {
+	const uri = "file:///ws/go/services/auth/handler.go"
+	const unit = "go/services/auth"
+	p, buf := newTestProxy()
+	p.root = "/ws"
+	p.appliedGen = 1
+	p.scope[unit] = &scopeEntry{open: map[string]bool{}, gen: 2} // pending
+
+	raw := []byte(`{"jsonrpc":"2.0","id":9,"method":"textDocument/inlayHint",` +
+		`"params":{"textDocument":{"uri":"` + uri + `"},"range":{"start":{"line":0,"character":0},"end":{"line":10,"character":0}}}}`)
+	var m message
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+
+	if !p.interceptClientRequest(raw, &m) {
+		t.Fatal("inlayHint for a pending unit should be held")
+	}
+	if strings.Contains(buf.String(), "inlayHint") {
+		t.Fatal("held inlayHint forwarded before release")
+	}
+
+	// didChange path releases it without the unit ever becoming applied.
+	p.releaseHeldDefs(uri)
+	// Unblock the waiter goroutine so its (idempotent) forward also runs.
+	p.advanceApplied(2)
+	waitFor(t, time.Second, "held inlayHint released on didChange", func() bool {
+		return strings.Contains(buf.String(), "textDocument/inlayHint")
+	})
+	time.Sleep(50 * time.Millisecond) // give the waiter a chance to double-write
+	if n := strings.Count(buf.String(), "textDocument/inlayHint"); n != 1 {
+		t.Errorf("held inlayHint written %d times, want exactly 1 (sync.Once)", n)
+	}
+}
+
 func TestEnsureUnitsLocked(t *testing.T) {
 	tests := []struct {
 		name     string
