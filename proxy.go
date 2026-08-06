@@ -61,8 +61,15 @@ type proxy struct {
 	workerSF singleflight.Group // dedups concurrent identical isolated-worker requests
 	worker   *workerHandle      // persistent isolated gopls for whole-workspace queries
 
-	idx   *revIndex
-	graph *graphServer
+	subWorkersMu sync.Mutex               // guards subWorkers only; kept separate from p.mu, matching subIdxMu
+	subWorkers   map[string]*workerHandle // nested module root -> its own isolated worker, built lazily via workerFor
+
+	idx      *revIndex
+	graph    *graphServer
+	modRoots *moduleRootCache // nested (e.g. worktree) go.mod detection for unitFor; nil is treated as "no nested modules"
+
+	subIdxMu sync.Mutex           // guards subIdx only; kept separate from p.mu, matching the per-concern locking used elsewhere
+	subIdx   map[string]*revIndex // nested module root -> its own reverse-import index, built lazily via indexFor
 
 	toServer *frameWriter
 	toClient *frameWriter
@@ -74,7 +81,7 @@ func (p *proxy) run() int {
 	cmd := exec.Command(p.opts.gopls, args...) //nolint:gosec // gopls path comes from user configuration, not untrusted input
 	cmd.Env = os.Environ()
 	if p.opts.driver {
-		g, err := startGraphServer(p.idx, p.log)
+		g, err := startGraphServer(p.idx, p.modRoots, p.indexFor, p.log)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "gopls-lazy: graph server: %v (continuing without driver)\n", err)
 		} else {
@@ -116,9 +123,83 @@ func (p *proxy) run() int {
 	go func() { p.pumpServer(bufio.NewReaderSize(serverOut, 1<<20)); done <- struct{}{} }()
 	<-done
 	p.worker.shutdown("proxy exiting")
+	p.subWorkersMu.Lock()
+	subs := make([]*workerHandle, 0, len(p.subWorkers))
+	for _, h := range p.subWorkers {
+		subs = append(subs, h)
+	}
+	p.subWorkersMu.Unlock()
+	for _, h := range subs {
+		h.shutdown("proxy exiting")
+	}
 	_ = cmd.Process.Kill()
 	_ = cmd.Wait()
 	return 0
+}
+
+// workerFor returns the isolated worker handle responsible for modRoot: the
+// persistent main-workspace worker for "" (the main module), or a lazily
+// created, per-module handle for a nested module root (e.g. a git worktree
+// with its own go.mod). A second call for the same modRoot returns the same
+// handle. The returned handle is not started here — like the main worker, it
+// lazily spawns its gopls process on first ensureStarted/acquire/request.
+func (p *proxy) workerFor(modRoot string) *workerHandle {
+	if modRoot == "" {
+		return p.worker
+	}
+	p.subWorkersMu.Lock()
+	defer p.subWorkersMu.Unlock()
+	if p.subWorkers == nil {
+		p.subWorkers = map[string]*workerHandle{}
+	}
+	h, ok := p.subWorkers[modRoot]
+	if !ok {
+		h = &workerHandle{p: p, root: modRoot}
+		p.subWorkers[modRoot] = h
+	}
+	return h
+}
+
+// observeWorker mirrors an editor notification onto the isolated worker(s)
+// whose view it affects. A document-scoped notification (didOpen/didChange/
+// didClose and similar) is delivered only to the worker owning that
+// document's module, resolved via workerFor. A workspace-level notification
+// with no textDocument (didChangeConfiguration, didChangeWatchedFiles, ...)
+// has no single owning module, so it is broadcast to the main worker and
+// every ALREADY-CREATED sub-worker — never to a sub-worker that would have to
+// be lazily created just to receive it, since that would spin up an idle
+// worker for every module ever seen.
+func (p *proxy) observeWorker(method string, params json.RawMessage) {
+	uri := docURI(params)
+	if uri == "" {
+		p.broadcastObserve(method, params)
+		return
+	}
+	path := uriToPath(uri)
+	p.mu.Lock()
+	root := p.root
+	p.mu.Unlock()
+	var modRoot string
+	if path != "" && root != "" && p.modRoots != nil {
+		modRoot = p.modRoots.RootFor(filepath.Dir(path), root)
+	}
+	p.workerFor(modRoot).observe(method, params)
+}
+
+// broadcastObserve delivers a workspace-level notification to the main
+// worker and every sub-worker that already exists, without creating any new
+// ones.
+func (p *proxy) broadcastObserve(method string, params json.RawMessage) {
+	p.worker.observe(method, params)
+	p.subWorkersMu.Lock()
+	subs := make([]*workerHandle, 0, len(p.subWorkers))
+	for _, h := range p.subWorkers {
+		subs = append(subs, h)
+	}
+	p.subWorkersMu.Unlock()
+	for _, h := range subs {
+		h.observe(method, params)
+	}
 }
 
 // pumpClient forwards editor->gopls traffic, patching initialize options and
@@ -163,7 +244,7 @@ func (p *proxy) pumpClient(r *bufio.Reader) {
 				continue // config response: written to gopls in-order by the handler
 			}
 		}
-		p.worker.observe(m.Method, m.Params)
+		p.observeWorker(m.Method, m.Params)
 		p.toServer.write(raw)
 	}
 }
@@ -222,7 +303,9 @@ func (p *proxy) handleClientResponse(raw []byte, m *message) bool {
 	}
 	p.toServer.write(p.patchConfigResponse(raw, m))
 	p.advanceApplied(gen)
-	p.worker.observe("workspace/didChangeConfiguration", nil)
+	// Workspace-level: every worker's settings changed, not just the main
+	// one's, so broadcast rather than routing to a single module's worker.
+	p.broadcastObserve("workspace/didChangeConfiguration", nil)
 	return true
 }
 
@@ -440,12 +523,34 @@ func (p *proxy) interceptWorkspaceSymbol(raw []byte, m *message) bool {
 	query := params.Query
 	held := append([]byte(nil), raw...)
 	go func() {
-		if !p.idx.WaitReady(10 * time.Second) {
+		// A single 10s budget covers the main index and every sub-index below,
+		// so N nested modules never turn a 10s budget into N*10s.
+		deadline := time.Now().Add(10 * time.Second)
+		if !p.idx.WaitReady(time.Until(deadline)) {
 			p.log.Printf("workspace/symbol: index not ready in time, forwarding to gopls")
 			p.toServer.write(held)
 			return
 		}
-		symbols := p.idx.WorkspaceSymbols(query)
+		results := [][]workspaceSymbol{p.idx.WorkspaceSymbols(query)}
+
+		p.subIdxMu.Lock()
+		subs := make([]*revIndex, 0, len(p.subIdx))
+		for _, ri := range p.subIdx {
+			subs = append(subs, ri)
+		}
+		p.subIdxMu.Unlock()
+
+		for _, ri := range subs {
+			remaining := time.Until(deadline)
+			if remaining <= 0 || !ri.WaitReady(remaining) {
+				// Not ready within the shared budget: skip it rather than block
+				// further, so one slow-building sub-index cannot stall the rest.
+				continue
+			}
+			results = append(results, ri.WorkspaceSymbols(query))
+		}
+
+		symbols := mergeWorkspaceSymbols(results...)
 		p.respond(id, symbols)
 		p.log.Printf("workspace/symbol: query=%q results=%d", query, len(symbols))
 	}()
@@ -721,27 +826,138 @@ func (p *proxy) observeClose(params json.RawMessage) {
 	}
 }
 
-// evictLoop drops scope units that have had no open files for the TTL.
+// evictLoop drops scope units that have had no open files for the TTL, then
+// any nested module whose scope units were just evicted (or never existed)
+// and which has no open document under its root.
 func (p *proxy) evictLoop() {
 	ttl := p.opts.evictTTL
 	tick := time.NewTicker(time.Minute)
 	defer tick.Stop()
 	for range tick.C {
-		now := time.Now()
-		p.mu.Lock()
-		changed := false
-		for unit, e := range p.scope {
-			if len(e.open) == 0 && now.Sub(e.lastActive) > ttl {
-				delete(p.scope, unit)
-				p.log.Printf("scope -= %s (idle %s)", unit, ttl)
-				changed = true
-			}
-		}
-		p.mu.Unlock()
-		if changed {
-			p.pushScope()
+		p.evictIdleUnits(ttl)
+		p.evictIdleModules()
+	}
+}
+
+// evictIdleUnits drops scope units that have had no open files for ttl. Split
+// out from evictLoop so tests can drive a sweep directly without waiting on
+// the real per-minute ticker.
+func (p *proxy) evictIdleUnits(ttl time.Duration) {
+	now := time.Now()
+	p.mu.Lock()
+	changed := false
+	for unit, e := range p.scope {
+		if len(e.open) == 0 && now.Sub(e.lastActive) > ttl {
+			delete(p.scope, unit)
+			p.log.Printf("scope -= %s (idle %s)", unit, ttl)
+			changed = true
 		}
 	}
+	p.mu.Unlock()
+	if changed {
+		p.pushScope()
+	}
+}
+
+// evictIdleModules drops the subIdx entry and graph subslot for every nested
+// module (e.g. a git worktree with its own go.mod) that currently has no
+// surviving scope unit and no open document under its root. It is memory-only
+// bookkeeping: a re-touch after eviction lazily rebuilds both via indexFor
+// and the graph subslot's own lazy-create-on-miss (subslotFor), exactly as
+// for a module never seen before.
+//
+// The open-docs check is authoritative and independent of the scope-unit
+// bookkeeping above: a file can in principle be open without contributing an
+// "active" scope entry in edge cases, and evicting a module out from under an
+// open file would break active edits, so p.openDocs is consulted directly
+// rather than inferred from scope-unit absence.
+//
+// moduleRootCache entries (p.modRoots) are deliberately left untouched here:
+// it caches per QUERIED DIRECTORY, not per module root, so there is no single
+// key corresponding to "this module" to drop without an O(n) scan-by-value
+// over the whole cache. Its entries never become wrong (go.mod presence
+// hasn't changed, only editor activity has), only unnecessary to keep, so
+// leaving them is harmless and a scan-and-remove would be over-engineering
+// for a cache that self-corrects.
+func (p *proxy) evictIdleModules() {
+	p.mu.Lock()
+	root := p.root
+	units := make([]string, 0, len(p.scope))
+	for u := range p.scope {
+		units = append(units, u)
+	}
+	docPaths := make([]string, 0, len(p.openDocs))
+	for _, doc := range p.openDocs {
+		docPaths = append(docPaths, uriToPath(doc.URI))
+	}
+	p.mu.Unlock()
+	if root == "" {
+		return
+	}
+
+	p.subIdxMu.Lock()
+	roots := make(map[string]bool, len(p.subIdx))
+	for r := range p.subIdx {
+		roots[r] = true
+	}
+	p.subIdxMu.Unlock()
+	if p.graph != nil {
+		for _, r := range p.graph.subslotRoots() {
+			roots[r] = true
+		}
+	}
+
+	for modRoot := range roots {
+		if docUnderModule(docPaths, modRoot) {
+			continue
+		}
+		prefix := moduleUnitPrefix(root, modRoot)
+		if prefix == "" || unitUnderModule(units, prefix) {
+			continue
+		}
+		p.subIdxMu.Lock()
+		delete(p.subIdx, modRoot)
+		p.subIdxMu.Unlock()
+		if p.graph != nil {
+			p.graph.RemoveSlot(modRoot)
+		}
+		p.log.Printf("module -= %s (idle, subIdx+graph subslot evicted)", modRoot)
+	}
+}
+
+// moduleUnitPrefix returns the root-relative slash path a nested module's own
+// scope units are prefixed with (see prefixUnit/unitFor), or "" when modRoot
+// is not (strictly) under root.
+func moduleUnitPrefix(root, modRoot string) string {
+	rel, err := filepath.Rel(root, modRoot)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return ""
+	}
+	return filepath.ToSlash(rel)
+}
+
+// unitUnderModule reports whether any scope unit in units belongs to the
+// nested module whose scope units are prefixed with prefix (see
+// moduleUnitPrefix/prefixUnit).
+func unitUnderModule(units []string, prefix string) bool {
+	for _, u := range units {
+		if u == prefix || strings.HasPrefix(u, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// docUnderModule reports whether any open document path lives at or under
+// modRoot. Mirrors the root-prefix check workerStateFor uses to scope
+// p.openDocs to a nested module's worker.
+func docUnderModule(docPaths []string, modRoot string) bool {
+	for _, path := range docPaths {
+		if path == modRoot || strings.HasPrefix(path, modRoot+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *proxy) onDiagnostics(params json.RawMessage) {
@@ -772,6 +988,24 @@ func (p *proxy) diagArrived(uri, why string) {
 // observeFileEvent keeps the reverse-import index and the package-graph
 // cache in sync with on-disk changes (saves, git operations seen by the
 // editor's file watcher).
+// invalidateModuleBoundary drops caches that go stale when a go.mod at path
+// appears or disappears: the module-root cache (every cached RootFor answer
+// may now be wrong) and the subIdx entry keyed by this go.mod's own
+// directory (the module root it defines). The subIdx entry is stale either
+// way — dropping it here makes it lazily rebuild on next access via
+// indexFor, whether the module just appeared (no entry yet, a harmless
+// no-op delete) or just disappeared (the entry indexed a module that no
+// longer exists).
+func (p *proxy) invalidateModuleBoundary(gomodPath string) {
+	if p.modRoots != nil {
+		p.modRoots.Invalidate()
+	}
+	modDir := filepath.Dir(gomodPath)
+	p.subIdxMu.Lock()
+	delete(p.subIdx, modDir)
+	p.subIdxMu.Unlock()
+}
+
 func (p *proxy) observeFileEvent(uri string) {
 	path := uriToPath(uri)
 	if path == "" {
@@ -784,10 +1018,7 @@ func (p *proxy) observeFileEvent(uri string) {
 		return
 	}
 	base := filepath.Base(path)
-	if base == "go.mod" || base == "go.sum" || base == "go.work" || base == "go.work.sum" {
-		if p.graph != nil {
-			p.graph.MarkStale("module file changed: " + base)
-		}
+	if p.handleModuleFileEvent(path, base) {
 		return
 	}
 	if !strings.HasSuffix(path, ".go") {
@@ -796,16 +1027,43 @@ func (p *proxy) observeFileEvent(uri string) {
 		// JSON, editor temp files) would fire a full `go list ./...` rebuild on
 		// noise and starve type-checking, so check the embed footprint first.
 		if p.graph != nil && p.graph.IsEmbedFile(path) {
-			p.graph.MarkStale("embedded asset changed: " + base)
+			p.graph.MarkStaleFor(path, "embedded asset changed: "+base)
 		}
 		return
 	}
-	go func() {
-		changed := p.idx.UpdateFile(path)
-		if changed && p.graph != nil {
-			p.graph.MarkStale("imports or embed directives changed: " + path)
-		}
-	}()
+	go p.updateFileInIndex(path, root)
+}
+
+// handleModuleFileEvent handles a save/watch event for a module-defining
+// file (go.mod, go.sum, go.work, go.work.sum), invalidating the caches that
+// depend on it. It reports whether path was such a file (and was therefore
+// handled and requires no further processing by observeFileEvent).
+func (p *proxy) handleModuleFileEvent(path, base string) bool {
+	if base != "go.mod" && base != "go.sum" && base != "go.work" && base != "go.work.sum" {
+		return false
+	}
+	if base == "go.mod" {
+		p.invalidateModuleBoundary(path)
+	}
+	if p.graph != nil {
+		p.graph.MarkStaleFor(path, "module file changed: "+base)
+	}
+	return true
+}
+
+// updateFileInIndex re-parses a changed .go file in the reverse-import index
+// that owns its module (see indexFor) and marks the package graph stale if
+// its import or embed footprint changed. Run in a goroutine by
+// observeFileEvent.
+func (p *proxy) updateFileInIndex(path, root string) {
+	var modRoot string
+	if p.modRoots != nil {
+		modRoot = p.modRoots.RootFor(filepath.Dir(path), root)
+	}
+	changed := p.indexFor(modRoot).UpdateFile(path)
+	if changed && p.graph != nil {
+		p.graph.MarkStaleFor(path, "imports or embed directives changed: "+path)
+	}
 }
 
 func (p *proxy) observeWatchedFiles(params json.RawMessage) {

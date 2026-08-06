@@ -41,6 +41,33 @@ func newRevIndex(logger *log.Logger) *revIndex {
 	}
 }
 
+// indexFor returns the reverse-import index responsible for modRoot.
+// modRoot == "" (the main module) returns p.idx unchanged. For a nested
+// module root it lazily creates a dedicated *revIndex and starts building it
+// in the background on first access — the same lazy-build pattern
+// patchInitialize uses for the main index — then returns it, possibly still
+// building. Callers that need the index to be ready call WaitReady
+// themselves with their own timeout; indexFor never blocks.
+func (p *proxy) indexFor(modRoot string) *revIndex {
+	if modRoot == "" {
+		return p.idx
+	}
+	p.subIdxMu.Lock()
+	if p.subIdx == nil {
+		p.subIdx = map[string]*revIndex{}
+	}
+	ri, ok := p.subIdx[modRoot]
+	if !ok {
+		ri = newRevIndex(p.log)
+		p.subIdx[modRoot] = ri
+	}
+	p.subIdxMu.Unlock()
+	if !ok {
+		go ri.Build(modRoot)
+	}
+	return ri
+}
+
 func (ri *revIndex) Ready() bool {
 	select {
 	case <-ri.readyCh:
@@ -76,7 +103,11 @@ func (ri *revIndex) Build(root string) {
 		if d.IsDir() {
 			name := d.Name()
 			if path != root && (strings.HasPrefix(name, ".") || strings.HasPrefix(name, "_") ||
-				name == "vendor" || name == "node_modules") {
+				name == "vendor" || name == "node_modules" || hasGoMod(path)) {
+				// hasGoMod: path is itself the root of a nested Go module (e.g. a
+				// git worktree living anywhere under root, dot-dir or not) — stop
+				// here so the outer index never claims packages that belong to a
+				// different module's own index (see indexFor).
 				return filepath.SkipDir
 			}
 			return nil

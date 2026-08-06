@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -41,6 +42,11 @@ type workerResponse struct {
 // after an idle TTL.
 type workerHandle struct {
 	p *proxy
+
+	// root is "" for the main workspace worker (mirrors the whole workspace,
+	// via workerStateFor(p.root)) or a nested module's own root for a
+	// per-module worker created by workerFor, which loads only that module.
+	root string
 
 	mu         sync.Mutex
 	client     *workerClient
@@ -125,8 +131,8 @@ func (h *workerHandle) ensureStartedLocked() (*workerClient, chan struct{}, int,
 	if h.client != nil {
 		return h.client, h.ready, h.gen, nil
 	}
-	state := h.p.workerState()
-	if state.root == "" {
+	state := h.p.workerStateFor(h.root)
+	if h.root == "" && state.root == "" {
 		return nil, nil, 0, fmt.Errorf("workspace root is not initialized")
 	}
 
@@ -157,8 +163,9 @@ func (h *workerHandle) ensureStartedLocked() (*workerClient, chan struct{}, int,
 	h.gen++
 	gen := h.gen
 	ready := make(chan struct{})
+	root := h.root
 	client := &workerClient{
-		stateFn: h.p.workerState,
+		stateFn: func() workerState { return h.p.workerStateFor(root) },
 		in:      newFrameWriter(stdin),
 		out:     bufio.NewReaderSize(stdout, 1<<20),
 		pending: map[string]chan workerResponse{},
@@ -462,20 +469,53 @@ func gracefulStop(c *workerClient, cmd *exec.Cmd) {
 	time.AfterFunc(2*time.Second, func() { _ = cmd.Process.Kill() })
 }
 
-// workerState snapshots the current editor-visible state for a worker gopls.
+// workerState snapshots the current editor-visible state for the main
+// workspace worker. Thin wrapper around workerStateFor(p.root).
 func (p *proxy) workerState() workerState {
 	p.mu.Lock()
+	root := p.root
+	p.mu.Unlock()
+	return p.workerStateFor(root)
+}
+
+// workerStateFor snapshots the current editor-visible state for the worker
+// responsible for root: the main workspace worker for root == "" or
+// root == p.root, or a per-module worker for a nested module root otherwise.
+//
+// The main worker's snapshot is byte-for-byte what workerState produced
+// before per-module workers existed: every entry in p.openDocs (unfiltered)
+// and the editor's own initialize params. A nested module's worker instead
+// gets no initialize params (workerClient.initialize falls back to
+// defaultInitializeParams(root), which is self-sufficient for a bare module
+// root) and only the open documents that live under it; both share the same
+// editor configuration clone, since gopls settings are workspace-wide.
+func (p *proxy) workerStateFor(root string) workerState {
+	p.mu.Lock()
 	defer p.mu.Unlock()
+	config := append([]json.RawMessage(nil), p.workerConfig...)
+	if root == "" || root == p.root {
+		docs := make([]openDoc, 0, len(p.openDocs))
+		for _, doc := range p.openDocs {
+			docs = append(docs, doc)
+		}
+		return workerState{
+			root:       p.root,
+			initParams: append(json.RawMessage(nil), p.workerInit...),
+			config:     config,
+			docs:       docs,
+		}
+	}
 	docs := make([]openDoc, 0, len(p.openDocs))
 	for _, doc := range p.openDocs {
-		docs = append(docs, doc)
+		path := uriToPath(doc.URI)
+		if path == root || strings.HasPrefix(path, root+string(filepath.Separator)) {
+			docs = append(docs, doc)
+		}
 	}
-	config := append([]json.RawMessage(nil), p.workerConfig...)
 	return workerState{
-		root:       p.root,
-		initParams: append(json.RawMessage(nil), p.workerInit...),
-		config:     config,
-		docs:       docs,
+		root:   root,
+		config: config,
+		docs:   docs,
 	}
 }
 

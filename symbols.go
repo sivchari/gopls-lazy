@@ -195,6 +195,33 @@ func (ri *revIndex) WorkspaceSymbols(query string) []workspaceSymbol {
 	return out
 }
 
+// mergeWorkspaceSymbols combines the already-scored, already-capped results
+// of independent WorkspaceSymbols calls (one per revIndex — the main index
+// plus every ready sub-index) into a single response. It deliberately does
+// not re-run the scoring in WorkspaceSymbols: workspaceSymbol is the
+// LSP-shaped output and no longer carries a score, so the best observable
+// substitute is to re-sort by name and then by location URI (the same
+// tie-break WorkspaceSymbols falls back to after score and name) and re-cap
+// at maxWorkspaceSymbols. Each input list was already capped independently,
+// so this does not silently drop matches below what a single-index query for
+// the same terms would have returned; it only bounds the combined total.
+func mergeWorkspaceSymbols(results ...[]workspaceSymbol) []workspaceSymbol {
+	var merged []workspaceSymbol
+	for _, r := range results {
+		merged = append(merged, r...)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].Name != merged[j].Name {
+			return merged[i].Name < merged[j].Name
+		}
+		return merged[i].Location.URI < merged[j].Location.URI
+	})
+	if len(merged) > maxWorkspaceSymbols {
+		merged = merged[:maxWorkspaceSymbols]
+	}
+	return merged
+}
+
 type scoredSymbol struct {
 	sym   indexedSymbol
 	score int

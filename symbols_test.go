@@ -1,10 +1,12 @@
 package goplslazy
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -91,5 +93,39 @@ func (t *T) M() {}
 		if kind, ok := want[sym.Name]; !ok || sym.Kind != kind {
 			t.Fatalf("unexpected symbol %#v", sym)
 		}
+	}
+}
+
+func TestMergeWorkspaceSymbols_CombinesAndSorts(t *testing.T) {
+	a := []workspaceSymbol{{Name: "Zeta"}, {Name: "Alpha"}}
+	b := []workspaceSymbol{{Name: "Mid"}}
+
+	got := mergeWorkspaceSymbols(a, b)
+
+	var names []string
+	for _, s := range got {
+		names = append(names, s.Name)
+	}
+	want := []string{"Alpha", "Mid", "Zeta"}
+	if !reflect.DeepEqual(names, want) {
+		t.Errorf("mergeWorkspaceSymbols names = %v, want %v", names, want)
+	}
+}
+
+func TestMergeWorkspaceSymbols_RecapsCombinedTotal(t *testing.T) {
+	var many []workspaceSymbol
+	for i := range maxWorkspaceSymbols + 50 {
+		many = append(many, workspaceSymbol{Name: fmt.Sprintf("sym%04d", i)})
+	}
+
+	got := mergeWorkspaceSymbols(many, nil)
+
+	if len(got) != maxWorkspaceSymbols {
+		t.Fatalf("mergeWorkspaceSymbols len = %d, want cap %d", len(got), maxWorkspaceSymbols)
+	}
+	// The cap must keep the lexicographically-first results, not an arbitrary
+	// prefix of the concatenation.
+	if got[0].Name != "sym0000" {
+		t.Errorf("first result = %q, want sym0000 (sorted before cap)", got[0].Name)
 	}
 }
