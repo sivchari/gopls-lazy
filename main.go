@@ -34,60 +34,85 @@ import (
 )
 
 type options struct {
-	gopls       string
-	granularity int
-	debounce    time.Duration
-	evictTTL    time.Duration // 0 disables eviction
-	driver      bool
-	logPath     string
-	goplsArgs   []string // unrecognized flags, forwarded to gopls
+	gopls         string
+	granularity   int
+	debounce      time.Duration
+	evictTTL      time.Duration // 0 disables eviction
+	driver        bool
+	logPath       string
+	workerTTL     time.Duration // idle time before the whole-workspace worker is evicted; 0 disables
+	workerTimeout time.Duration // budget for a single worker query
+	workerWarm    bool          // start the worker at initialize instead of on first query
+	goplsArgs     []string      // unrecognized flags, forwarded to gopls
 }
 
-// parseArgs understands gopls-lazy's own flags and forwards everything else
-// to gopls (editors like VS Code pass extra flags to the configured "gopls"
-// binary). Defaults can also come from GOPLS_LAZY_* environment variables,
-// for editor configs that cannot pass arguments.
-func parseArgs(args []string, getenv func(string) string) (options, error) { //nolint:gocognit,cyclop // flag parser with many env vars and flags is inherently complex
-	o := options{
-		gopls:       "gopls",
-		granularity: 3,
-		debounce:    500 * time.Millisecond,
-		evictTTL:    10 * time.Minute,
-		driver:      true,
-	}
+// applyEnv overrides option defaults from GOPLS_LAZY_* environment variables,
+// for editor configs that cannot pass command-line flags.
+func applyEnv(o *options, getenv func(string) string) error {
 	if v := getenv("GOPLS_LAZY_GOPLS"); v != "" {
 		o.gopls = v
 	}
 	if v := getenv("GOPLS_LAZY_GRANULARITY"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil {
-			return o, fmt.Errorf("GOPLS_LAZY_GRANULARITY: %w", err)
+			return fmt.Errorf("GOPLS_LAZY_GRANULARITY: %w", err)
 		}
 		o.granularity = n
 	}
-	if v := getenv("GOPLS_LAZY_DEBOUNCE"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return o, fmt.Errorf("GOPLS_LAZY_DEBOUNCE: %w", err)
-		}
-		o.debounce = d
+	durations := []struct {
+		key string
+		dst *time.Duration
+	}{
+		{"GOPLS_LAZY_DEBOUNCE", &o.debounce},
+		{"GOPLS_LAZY_EVICT", &o.evictTTL},
+		{"GOPLS_LAZY_WORKER_TTL", &o.workerTTL},
+		{"GOPLS_LAZY_WORKER_TIMEOUT", &o.workerTimeout},
 	}
-	if v := getenv("GOPLS_LAZY_EVICT"); v != "" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return o, fmt.Errorf("GOPLS_LAZY_EVICT: %w", err)
+	for _, e := range durations {
+		if v := getenv(e.key); v != "" {
+			d, err := time.ParseDuration(v)
+			if err != nil {
+				return fmt.Errorf("%s: %w", e.key, err)
+			}
+			*e.dst = d
 		}
-		o.evictTTL = d
 	}
 	if v := getenv("GOPLS_LAZY_DRIVER"); v != "" && v != "1" {
 		b, err := strconv.ParseBool(v)
 		if err != nil {
-			return o, fmt.Errorf("GOPLS_LAZY_DRIVER: %w", err)
+			return fmt.Errorf("GOPLS_LAZY_DRIVER: %w", err)
 		}
 		o.driver = b
 	}
 	if v := getenv("GOPLS_LAZY_LOG"); v != "" {
 		o.logPath = v
+	}
+	if v := getenv("GOPLS_LAZY_WORKER_WARM"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return fmt.Errorf("GOPLS_LAZY_WORKER_WARM: %w", err)
+		}
+		o.workerWarm = b
+	}
+	return nil
+}
+
+// parseArgs understands gopls-lazy's own flags and forwards everything else
+// to gopls (editors like VS Code pass extra flags to the configured "gopls"
+// binary). Defaults can also come from GOPLS_LAZY_* environment variables,
+// for editor configs that cannot pass arguments.
+func parseArgs(args []string, getenv func(string) string) (options, error) { //nolint:gocognit,cyclop // the flag switch dispatches many flags and is clearer as one linear block than fragmented across helpers
+	o := options{
+		gopls:         "gopls",
+		granularity:   3,
+		debounce:      500 * time.Millisecond,
+		evictTTL:      10 * time.Minute,
+		driver:        true,
+		workerTTL:     15 * time.Minute,
+		workerTimeout: 10 * time.Minute,
+	}
+	if err := applyEnv(&o, getenv); err != nil {
+		return o, err
 	}
 
 	for i := 0; i < len(args); i++ {
@@ -133,6 +158,22 @@ func parseArgs(args []string, getenv func(string) string) (options, error) { //n
 			}
 		case "-log", "--log":
 			o.logPath, err = next()
+		case "-worker-ttl", "--worker-ttl":
+			var v string
+			if v, err = next(); err == nil {
+				o.workerTTL, err = time.ParseDuration(v)
+			}
+		case "-worker-timeout", "--worker-timeout":
+			var v string
+			if v, err = next(); err == nil {
+				o.workerTimeout, err = time.ParseDuration(v)
+			}
+		case "-worker-warm", "--worker-warm":
+			if hasValue {
+				o.workerWarm, err = strconv.ParseBool(value)
+			} else {
+				o.workerWarm = true
+			}
 		default:
 			o.goplsArgs = append(o.goplsArgs, arg)
 		}
@@ -190,5 +231,6 @@ func Run() int {
 		idx:         newRevIndex(logger),
 		log:         logger,
 	}
+	p.worker = &workerHandle{p: p}
 	return p.run()
 }

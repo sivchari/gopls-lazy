@@ -68,9 +68,24 @@ func (p *proxy) resolveAndExpand(method, uri string, line, char int, held []byte
 	root := p.root
 	p.mu.Unlock()
 
+	// gopls resolves the definition below against the requesting file's
+	// package, so that package must be in an applied view first: right after
+	// didOpen the unit can still be pending, and gopls would serve the file
+	// in orphan mode and resolve nothing.
+	reqPath := uriToPath(uri)
+	waited := p.awaitRequestUnit(reqPath)
+
 	// Resolve the defining location; fall back to the requesting file.
-	defPath, defLine := uriToPath(uri), line
-	if loc := p.askDefinition(uri, line, char); loc != nil {
+	defPath, defLine := reqPath, line
+	loc := p.askDefinition(uri, line, char)
+	if loc == nil && waited {
+		// We blocked for the requesting unit to become applied, so the first ask
+		// may have raced the view swap; retry once now that it is applied. When
+		// the unit was already applied (waited=false) a nil result is final —
+		// retrying would only repeat the same answer, so fall through.
+		loc = p.askDefinition(uri, line, char)
+	}
+	if loc != nil {
 		defPath, defLine = loc.path, loc.line
 	}
 	relDir, err := filepath.Rel(root, filepath.Dir(defPath))
@@ -89,46 +104,71 @@ func (p *proxy) resolveAndExpand(method, uri string, line, char int, held []byte
 		return
 	}
 
-	if !p.idx.WaitReady(30 * time.Second) {
-		p.log.Printf("crossref %s: index not ready in time, forwarding as-is", method)
+	if !p.idx.WaitReady(120 * time.Second) {
+		p.log.Printf("crossref %s: reverse-import index STILL not ready after 120s; forwarding as-is, results may be TRUNCATED", method)
 		p.toServer.write(held)
 		return
 	}
 
-	p.mu.Lock()
 	units := p.idx.ClosureUnits(relDir, p.opts.granularity)
-	var need []string
-	for _, u := range units {
-		if p.scope[u] == nil {
-			need = append(need, u)
-		}
-	}
-	for _, u := range need {
-		p.scope[u] = &scopeEntry{open: map[string]bool{}, lastActive: time.Now()}
-	}
-	expanded := len(need) > 0
-	reason := fmt.Sprintf("closure of %s: +%v", relDir, need)
-	if !expanded {
-		p.mu.Unlock()
-		p.toServer.write(held)
-		return
-	}
-	p.held = append(p.held, held)
-	p.awaitingLoad = true
-	if p.holdTimer != nil {
-		p.holdTimer.Stop()
-	}
-	p.holdTimer = time.AfterFunc(60*time.Second, func() { p.flushHeld("timeout") })
-	p.log.Printf("crossref %s: %s, holding request", method, reason)
+	p.mu.Lock()
+	needGen, needPush := p.ensureUnitsLocked(units)
 	p.mu.Unlock()
-	p.pushScope()
+	if needPush {
+		needGen = p.pushScope()
+		p.log.Printf("crossref %s: closure of %s published at gen %d, holding request", method, relDir, needGen)
+	}
+	if !p.awaitApplied(needGen, 60*time.Second) {
+		p.log.Printf("crossref %s: gen %d not applied within 60s; forwarding anyway, results may be TRUNCATED", method, needGen)
+	}
+	// Releasing here is a sufficient barrier without a separate load-wait:
+	// awaitApplied returns only after the patched workspace/configuration
+	// response reached gopls, and gopls handles stream messages in order, so its
+	// references/rename handler cannot start until the didChangeConfiguration
+	// handler has recreated the views; the handler then blocks on the new view's
+	// metadata load (awaitLoaded) before answering. So this forwarded request
+	// sees at least the generation-needGen scope. Do not add a load-wait here.
+	p.toServer.write(held)
 }
 
-// serveViaWorker answers a cross-reference request from a short-lived isolated
+// awaitRequestUnit blocks until the requesting file's scope unit is applied
+// in gopls, so a proxy-originated definition request resolves against a real
+// view instead of orphan mode. It reports whether it actually waited.
+func (p *proxy) awaitRequestUnit(path string) bool {
+	unit, ok := p.unitFor(path)
+	if !ok {
+		return false
+	}
+	p.mu.Lock()
+	e := p.scope[unit]
+	gen := 0
+	if e != nil {
+		gen = e.gen
+	}
+	applied := gen > 0 && gen <= p.appliedGen
+	p.mu.Unlock()
+	if e == nil || applied {
+		// Never-opened file: proceed as-is (gopls falls back to orphan mode,
+		// and the requesting-file fallback below still applies).
+		return false
+	}
+	if !p.awaitUnitApplied(unit, 15*time.Second) {
+		p.log.Printf("crossref: requesting unit %s not applied within 15s", unit)
+	}
+	return true
+}
+
+// serveViaWorker answers a cross-reference request from the persistent isolated
 // gopls worker that loads the whole workspace, so the long-lived interactive
-// gopls is never widened. Concurrent identical requests (same method and
-// params) are coalesced via singleflight so a burst of repeats spawns a single
-// worker instead of one heavy gopls process each.
+// gopls is never widened. The first query on a cold worker is slow (the worker
+// warms in the background and a showMessage tells the user); subsequent queries
+// are fast. Concurrent identical requests (same method and params) are coalesced
+// via singleflight so a burst of repeats shares one worker call.
+//
+// On failure the response depends on the method: rename must not return
+// silently-partial results, so it fails with a retryable RequestFailed error;
+// references and implementation warn the user and fall back to the narrow main
+// gopls scope so the editor still gets whatever results are in view.
 func (p *proxy) serveViaWorker(method string, held []byte) {
 	p.log.Printf("crossref %s: isolated worker for method or implementation", method)
 	var req message
@@ -136,13 +176,15 @@ func (p *proxy) serveViaWorker(method string, held []byte) {
 		p.toServer.write(held)
 		return
 	}
+	if p.worker.shouldWarnLoading() {
+		p.showMessage(messageInfo, "gopls-lazy: loading the whole workspace for implementation/references; the first query may take minutes")
+	}
 	key := method + "\x00" + string(req.Params)
 	v, err, shared := p.workerSF.Do(key, func() (any, error) {
-		return p.runWorkerRequest(held)
+		return p.worker.request(held, p.opts.workerTimeout)
 	})
 	if err != nil {
-		p.log.Printf("crossref %s: worker failed: %v; forwarding to current main gopls scope", method, err)
-		p.toServer.write(held)
+		p.handleWorkerError(method, req.ID, held, err)
 		return
 	}
 	resp, ok := v.(*message)
@@ -158,6 +200,24 @@ func (p *proxy) serveViaWorker(method string, held []byte) {
 		return
 	}
 	p.respond(req.ID, resp.Result)
+}
+
+// handleWorkerError reports a failed worker query. Rename gets a retryable
+// RequestFailed error (a partial rename is dangerous); references and
+// implementation warn and fall back to the main gopls scope. prepareRename
+// never reaches the worker (it takes the light single-unit path), so it is not
+// handled here.
+func (p *proxy) handleWorkerError(method string, id, held []byte, err error) {
+	switch method {
+	case methodRename:
+		p.log.Printf("crossref %s: worker unavailable: %v; returning retryable error", method, err)
+		p.respondError(id, requestFailedError(
+			fmt.Sprintf("gopls-lazy: whole-workspace index unavailable (%v); retry shortly", err)))
+	default:
+		p.log.Printf("crossref %s: worker unavailable: %v; forwarding to main gopls (results may be incomplete)", method, err)
+		p.showMessage(messageWarning, fmt.Sprintf("gopls-lazy: %s results may be incomplete: %v", method, err))
+		p.toServer.write(held)
+	}
 }
 
 func methodNeedsGlobalMethodRefs(method string) bool {
@@ -194,7 +254,7 @@ func (p *proxy) askDefinition(uri string, line, char int) *defLocation {
 	req := message{
 		JSONRPC: jsonrpcVersion,
 		ID:      json.RawMessage(id),
-		Method:  "textDocument/definition",
+		Method:  methodDefinition,
 		Params:  params,
 	}
 	raw, err := json.Marshal(req)

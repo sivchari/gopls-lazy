@@ -31,27 +31,35 @@ type message struct {
 type scopeEntry struct {
 	open       map[string]bool
 	lastActive time.Time
+	gen        int // scope generation at which the unit was first published to gopls; 0 = not yet published
 }
 
 type proxy struct {
 	opts options
 
-	mu           sync.Mutex
-	root         string                 // workspace root filesystem path
-	scope        map[string]*scopeEntry // scope units relative to root
-	configIDs    map[string]bool        // ids of pending server->client workspace/configuration requests
-	workerInit   json.RawMessage        // original initialize params for isolated worker gopls processes
-	workerConfig []json.RawMessage      // original workspace/configuration settings, before lazy filters
-	openDocs     map[string]openDoc     // current open document overlays for worker gopls processes
-	pendingDiag  map[string]bool        // opened uris whose first diagnostics have not arrived yet
-	rescopeTimer *time.Timer
-	held         [][]byte // requests waiting for the re-scoped view
-	awaitingLoad bool     // a held-triggered rescope is in flight
-	holdTimer    *time.Timer
-	pendingOwn   map[string]chan *message // proxy-originated request ids -> response channel
-	ownSeq       int
+	mu            sync.Mutex
+	root          string                 // workspace root filesystem path
+	scope         map[string]*scopeEntry // scope units relative to root
+	configIDs     map[string]bool        // ids of pending server->client workspace/configuration requests
+	configGens    map[string]int         // config request id -> scopeGen when the pull arrived (lazily allocated)
+	sawConfigPull bool                   // true once gopls has issued any workspace/configuration pull (editor supports pull config)
+	scopeGen      int                    // monotonically increasing scope generation; bumped by every publish
+	appliedGen    int                    // highest generation whose filters have been delivered to gopls
+	appliedCh     chan struct{}          // closed and re-made whenever appliedGen advances (lazily allocated)
+	heldDefs      map[string][]*heldReq  // document uri -> definition/prepareRename requests held for their unit (lazily allocated)
+	workerInit    json.RawMessage        // original initialize params for isolated worker gopls processes
+	workerConfig  []json.RawMessage      // original workspace/configuration settings, before lazy filters
+	openDocs      map[string]openDoc     // current open document overlays for worker gopls processes
+	pendingDiag   map[string]bool        // opened uris whose first diagnostics have not arrived yet
+	rescopeTimer  *time.Timer
+	pendingOwn    map[string]chan *message // proxy-originated request ids -> response channel
+	ownSeq        int
+
+	appliedFallbackDelay time.Duration // test hook; zero means the 10s default
+	appliedFallbackCap   time.Duration // test hook; zero means the 60s absolute cap
 
 	workerSF singleflight.Group // dedups concurrent identical isolated-worker requests
+	worker   *workerHandle      // persistent isolated gopls for whole-workspace queries
 
 	idx   *revIndex
 	graph *graphServer
@@ -107,6 +115,7 @@ func (p *proxy) run() int {
 	go func() { p.pumpClient(bufio.NewReaderSize(os.Stdin, 1<<20)); done <- struct{}{} }()
 	go func() { p.pumpServer(bufio.NewReaderSize(serverOut, 1<<20)); done <- struct{}{} }()
 	<-done
+	p.worker.shutdown("proxy exiting")
 	_ = cmd.Process.Kill()
 	_ = cmd.Wait()
 	return 0
@@ -135,7 +144,12 @@ func (p *proxy) pumpClient(r *bufio.Reader) {
 		case "textDocument/didOpen":
 			p.trackDidOpen(m.Params)
 			p.observeOpen(m.Params)
-		case "textDocument/didChange":
+		case methodDidChange:
+			// A held definition/prepareRename for this document carries the
+			// pre-edit cursor position; forward it now, before the didChange
+			// reaches gopls, so gopls resolves it against the text it was issued
+			// for instead of the shifted lines.
+			p.releaseHeldDefs(docURI(m.Params))
 			p.trackDidChange(m.Params)
 		case "textDocument/didClose":
 			p.trackDidClose(m.Params)
@@ -145,19 +159,31 @@ func (p *proxy) pumpClient(r *bufio.Reader) {
 		case "workspace/didChangeWatchedFiles":
 			p.observeWatchedFiles(m.Params)
 		case "":
-			raw = p.patchClientResponse(raw, &m)
+			if p.handleClientResponse(raw, &m) {
+				continue // config response: written to gopls in-order by the handler
+			}
 		}
+		p.worker.observe(m.Method, m.Params)
 		p.toServer.write(raw)
 	}
 }
 
 // interceptClientRequest takes over editor requests the proxy answers itself
-// (workspace symbols) or holds until the scope is wide enough (cross-refs).
-// It returns true when the request was swallowed and must not be forwarded.
+// (workspace symbols) or holds until the scope is wide enough. Cross-refs
+// (rename/references/implementation) hold for the whole reverse-import closure;
+// definition and prepareRename take the light path, holding only until the
+// requesting file's own scope unit is applied — prepareRename validates just
+// the symbol under the cursor, so it must not pay the closure/worker cost of a
+// full rename. It returns true when the request was swallowed and must not be
+// forwarded.
 func (p *proxy) interceptClientRequest(raw []byte, m *message) bool {
 	switch {
 	case m.Method == "workspace/symbol":
 		return p.interceptWorkspaceSymbol(raw, m)
+	case m.Method == methodDefinition:
+		return p.interceptDefinition(raw, m)
+	case m.Method == methodPrepareRename:
+		return p.interceptPrepareRename(raw, m)
 	case isCrossRef(m.Method):
 		return p.interceptCrossRef(raw, m)
 	default:
@@ -165,27 +191,147 @@ func (p *proxy) interceptClientRequest(raw []byte, m *message) bool {
 	}
 }
 
-// patchClientResponse patches an editor->gopls response if it answers a
-// workspace/configuration request the proxy saw going out.
-func (p *proxy) patchClientResponse(raw []byte, m *message) []byte {
+// handleClientResponse forwards an editor->gopls response itself when it
+// answers a workspace/configuration pull. The patched response must reach
+// gopls strictly before appliedGen advances — a goroutine woken by
+// awaitApplied writes its held request immediately, and if that write won
+// the race against the config response, gopls would answer it with the old
+// view. Writing here and advancing after gives that happens-before edge.
+// It returns true when the response was already forwarded.
+func (p *proxy) handleClientResponse(raw []byte, m *message) bool {
 	if m.ID == nil {
-		return raw
+		return false
 	}
 	p.mu.Lock()
 	isConfig := p.configIDs[string(m.ID)]
+	gen := p.configGens[string(m.ID)]
 	delete(p.configIDs, string(m.ID))
+	delete(p.configGens, string(m.ID))
 	p.mu.Unlock()
-	if isConfig {
-		return p.patchConfigResponse(raw, m)
+	if !isConfig {
+		return false
 	}
-	return raw
+	p.toServer.write(p.patchConfigResponse(raw, m))
+	p.advanceApplied(gen)
+	p.worker.observe("workspace/didChangeConfiguration", nil)
+	return true
+}
+
+// interceptDefinition holds a definition request until the requesting file's
+// scope unit has been applied by gopls. Without this, a definition arriving
+// right after didOpen is served from gopls's orphan mode and cross-package
+// definitions silently return empty results.
+func (p *proxy) interceptDefinition(raw []byte, m *message) bool {
+	return p.holdForRequestUnit(raw, m, 15*time.Second)
+}
+
+// interceptPrepareRename holds a prepareRename request on the same light
+// single-unit path as definition. prepareRename is an interactive validity
+// check for the symbol under the cursor: it needs only the requesting file's
+// unit loaded, not the reverse-import closure, so it must not go through the
+// closure/worker path a full rename uses. The timeout is short because the
+// rename popup is blocked until this returns.
+func (p *proxy) interceptPrepareRename(raw []byte, m *message) bool {
+	return p.holdForRequestUnit(raw, m, 5*time.Second)
+}
+
+// holdForRequestUnit holds raw until the requesting file's scope unit has been
+// applied by gopls, then forwards it. Used by definition and prepareRename.
+//
+// The common case (unit already applied) adds zero latency: the request is
+// forwarded inline by pumpClient. Held requests are forwarded from a goroutine,
+// which can reorder them after later didChange notifications. The request
+// carries an absolute cursor position, so a didChange that shifts lines before
+// the hold releases would make gopls resolve stale coordinates; the didChange
+// path guards against this by releasing any held request for the document
+// before the edit reaches gopls (see releaseHeldDefs). A sync.Once makes the
+// two possible forwarders (this goroutine and releaseHeldDefs) idempotent.
+func (p *proxy) holdForRequestUnit(raw []byte, m *message, timeout time.Duration) bool {
+	uri := docURI(m.Params)
+	unit, ok := p.unitFor(uriToPath(uri))
+	if !ok {
+		return false // outside the workspace root
+	}
+	p.mu.Lock()
+	e := p.scope[unit]
+	pending := e != nil && (e.gen == 0 || e.gen > p.appliedGen)
+	p.mu.Unlock()
+	if !pending {
+		// Entry nil (request for a never-opened file, e.g. an editor peek
+		// feature) or already applied: forward as-is.
+		return false
+	}
+	method := m.Method
+	hr := &heldReq{raw: append([]byte(nil), raw...)}
+	p.registerHeldDef(uri, hr)
+	go func() {
+		if !p.awaitUnitApplied(unit, timeout) {
+			p.log.Printf("%s: unit %s not applied within %s, forwarding anyway", method, unit, timeout)
+		}
+		hr.forward(p)
+		p.unregisterHeldDef(uri, hr)
+	}()
+	return true
+}
+
+// heldReq is a client request held pending its scope unit. Its forward is
+// idempotent so the applied-unit waiter and a racing didChange release can both
+// call it; only the first write reaches gopls.
+type heldReq struct {
+	raw  []byte
+	once sync.Once
+}
+
+func (h *heldReq) forward(p *proxy) {
+	h.once.Do(func() { p.toServer.write(h.raw) })
+}
+
+// registerHeldDef records a held definition/prepareRename under its document
+// uri so a later didChange for the same document can release it early.
+func (p *proxy) registerHeldDef(uri string, hr *heldReq) {
+	p.mu.Lock()
+	if p.heldDefs == nil {
+		p.heldDefs = map[string][]*heldReq{}
+	}
+	p.heldDefs[uri] = append(p.heldDefs[uri], hr)
+	p.mu.Unlock()
+}
+
+// unregisterHeldDef drops a held request once its waiter has forwarded it.
+func (p *proxy) unregisterHeldDef(uri string, hr *heldReq) {
+	p.mu.Lock()
+	s := p.heldDefs[uri]
+	for i, h := range s {
+		if h == hr {
+			p.heldDefs[uri] = append(s[:i], s[i+1:]...)
+			break
+		}
+	}
+	if len(p.heldDefs[uri]) == 0 {
+		delete(p.heldDefs, uri)
+	}
+	p.mu.Unlock()
+}
+
+// releaseHeldDefs forwards every definition/prepareRename still held for uri.
+// Called from the didChange path before the edit reaches gopls: the held
+// position predates the edit, so forwarding now resolves it against the
+// pre-edit text/scope it was issued for rather than the shifted lines.
+func (p *proxy) releaseHeldDefs(uri string) {
+	p.mu.Lock()
+	held := p.heldDefs[uri]
+	delete(p.heldDefs, uri)
+	p.mu.Unlock()
+	for _, hr := range held {
+		hr.forward(p)
+	}
 }
 
 // pumpServer forwards gopls->editor traffic. It remembers ids of
-// workspace/configuration requests, routes responses to proxy-originated
-// requests, fires the second stage of a two-stage rescope once orphan
-// diagnostics arrive, and releases held requests when the re-scoped
-// metadata load completes.
+// workspace/configuration requests (and the scope generation current when
+// each pull arrived, feeding the applied-generation barrier), routes
+// responses to proxy-originated requests, and fires the second stage of a
+// two-stage rescope once orphan diagnostics arrive.
 func (p *proxy) pumpServer(r *bufio.Reader) {
 	for {
 		raw, err := readFrame(r)
@@ -193,38 +339,76 @@ func (p *proxy) pumpServer(r *bufio.Reader) {
 			return
 		}
 		var m message
-		if json.Unmarshal(raw, &m) == nil {
-			if m.Method == "" && m.ID != nil {
-				p.mu.Lock()
-				ch := p.pendingOwn[string(m.ID)]
-				delete(p.pendingOwn, string(m.ID))
-				p.mu.Unlock()
-				if ch != nil {
-					ch <- &m
-					continue // proxy-originated; not for the editor
-				}
-			}
-			switch m.Method {
-			case "workspace/configuration":
-				if m.ID != nil {
-					p.mu.Lock()
-					p.configIDs[string(m.ID)] = true
-					p.mu.Unlock()
-				}
-			case "textDocument/publishDiagnostics":
-				p.onDiagnostics(m.Params)
-			case "window/logMessage":
-				p.onLogMessage(m.Params)
-			}
+		if json.Unmarshal(raw, &m) != nil {
+			p.toClient.write(raw)
+			continue
 		}
+		if p.handleServerResponse(&m) {
+			continue // proxy-originated; not for the editor
+		}
+		p.handleServerNotification(&m)
 		p.toClient.write(raw)
 	}
 }
 
+// handleServerResponse routes a gopls->proxy response back to the goroutine
+// that issued the proxy-originated request (workspace/symbol, cross-refs,
+// driver queries) through pendingOwn. It returns true when the response was
+// delivered to that goroutine and therefore must not be forwarded to the
+// editor.
+func (p *proxy) handleServerResponse(m *message) bool {
+	if m.Method != "" || m.ID == nil {
+		return false
+	}
+	p.mu.Lock()
+	ch := p.pendingOwn[string(m.ID)]
+	delete(p.pendingOwn, string(m.ID))
+	p.mu.Unlock()
+	if ch == nil {
+		return false
+	}
+	ch <- m
+	return true
+}
+
+// handleServerNotification runs the side effects for server->editor traffic
+// that is still forwarded verbatim by the caller: it remembers the ids of
+// workspace/configuration pulls (with the scope generation live when each
+// arrived, feeding the applied-generation barrier) and fires the second stage
+// of a two-stage rescope once orphan diagnostics arrive.
+func (p *proxy) handleServerNotification(m *message) {
+	switch m.Method {
+	case methodConfiguration:
+		if m.ID == nil {
+			return
+		}
+		p.mu.Lock()
+		p.configIDs[string(m.ID)] = true
+		// Remember that this editor answers configuration pulls at all, so the
+		// applied-generation fallback can tell a merely-slow config-supporting
+		// editor apart from one that never pulls (see armAppliedFallback).
+		p.sawConfigPull = true
+		if p.configGens == nil {
+			p.configGens = map[string]int{}
+		}
+		// The patched response will carry filters covering every unit
+		// published up to the current generation: pushScope bumps scopeGen
+		// before writing didChangeConfiguration, so a pull arriving here saw
+		// that write.
+		p.configGens[string(m.ID)] = p.scopeGen
+		p.mu.Unlock()
+	case "textDocument/publishDiagnostics":
+		p.onDiagnostics(m.Params)
+	}
+}
+
+// isCrossRef reports whether a method needs the whole reverse-import closure
+// (or the isolated worker) in scope before it can answer correctly.
+// prepareRename is deliberately excluded: it only validates the symbol under
+// the cursor and takes the light single-unit path instead.
 func isCrossRef(method string) bool {
 	switch method {
-	case methodRename, "textDocument/prepareRename",
-		methodReferences, methodImplementation:
+	case methodRename, methodReferences, methodImplementation:
 		return true
 	}
 	return false
@@ -270,6 +454,21 @@ func (p *proxy) respond(id json.RawMessage, result any) {
 		Result:  b,
 	}
 	raw, err := json.Marshal(resp)
+	if err != nil {
+		return
+	}
+	p.toClient.write(raw)
+}
+
+// showMessage sends a window/showMessage notification to the editor, used to
+// tell the user that a whole-workspace worker query is loading or degraded.
+func (p *proxy) showMessage(typ int, msg string) {
+	params, err := json.Marshal(map[string]any{"type": typ, "message": msg})
+	if err != nil {
+		return
+	}
+	note := message{JSONRPC: jsonrpcVersion, Method: methodShowMessage, Params: params}
+	raw, err := json.Marshal(note)
 	if err != nil {
 		return
 	}
@@ -336,6 +535,10 @@ func (p *proxy) patchInitialize(raw []byte, m *message) []byte {
 		p.mu.Unlock()
 	}
 	p.mu.Lock()
+	// The initial filters (including any restored scope) ride the initialize
+	// request itself, which gopls processes before anything else on the
+	// stream, so this first generation is applied by construction.
+	p.advanceAppliedLocked(p.stampScopeGenLocked())
 	setFilters(opts, p.filtersLocked())
 	p.mu.Unlock()
 	params["initializationOptions"] = opts
@@ -349,6 +552,11 @@ func (p *proxy) patchInitialize(raw []byte, m *message) []byte {
 		return raw
 	}
 	p.log.Printf("initialize: root=%s filters=%v", root, opts[optionDirectoryFilters])
+	if p.opts.workerWarm && root != "" {
+		// Start warming the whole-workspace worker now so the first global query
+		// does not pay the entire cold load itself.
+		go func() { _, _, _, _ = p.worker.ensureStarted() }()
+	}
 	return out
 }
 
@@ -480,7 +688,7 @@ func (p *proxy) observeOpen(params json.RawMessage) {
 		if p.rescopeTimer != nil {
 			p.rescopeTimer.Stop()
 		}
-		p.rescopeTimer = time.AfterFunc(p.opts.debounce, p.pushScope)
+		p.rescopeTimer = time.AfterFunc(p.opts.debounce, func() { p.pushScope() })
 	} else {
 		p.pendingDiag[uri] = true
 		p.log.Printf("scope += %s (open, waiting for orphan diagnostics)", unit)
@@ -548,45 +756,8 @@ func (p *proxy) diagArrived(uri, why string) {
 	if p.rescopeTimer != nil {
 		p.rescopeTimer.Stop()
 	}
-	p.rescopeTimer = time.AfterFunc(p.opts.debounce, p.pushScope)
+	p.rescopeTimer = time.AfterFunc(p.opts.debounce, func() { p.pushScope() })
 	p.mu.Unlock()
-}
-
-// onLogMessage watches gopls's own log for the go/packages.Load line that
-// marks the end of a metadata reload, releasing held requests.
-func (p *proxy) onLogMessage(params json.RawMessage) {
-	var lp struct {
-		Message string `json:"message"`
-	}
-	if json.Unmarshal(params, &lp) != nil {
-		return
-	}
-	p.mu.Lock()
-	waiting := p.awaitingLoad
-	p.mu.Unlock()
-	if waiting && strings.Contains(lp.Message, "go/packages.Load") {
-		// Give gopls a beat to swap in the new snapshot.
-		time.AfterFunc(300*time.Millisecond, func() { p.flushHeld("load complete") })
-	}
-}
-
-func (p *proxy) flushHeld(why string) {
-	p.mu.Lock()
-	held := p.held
-	p.held = nil
-	p.awaitingLoad = false
-	if p.holdTimer != nil {
-		p.holdTimer.Stop()
-		p.holdTimer = nil
-	}
-	p.mu.Unlock()
-	if len(held) == 0 {
-		return
-	}
-	p.log.Printf("releasing %d held request(s): %s", len(held), why)
-	for _, raw := range held {
-		p.toServer.write(raw)
-	}
 }
 
 // observeFileEvent keeps the reverse-import index and the package-graph
