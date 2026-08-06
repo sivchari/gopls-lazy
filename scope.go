@@ -69,10 +69,7 @@ func (p *proxy) unitFor(path string) (string, bool) {
 		return "", false
 	}
 	dir := filepath.Dir(path)
-	var modRoot string
-	if p.modRoots != nil {
-		modRoot = p.modRoots.RootFor(dir, root)
-	}
+	modRoot := p.modRootFor(dir, root)
 	base := root
 	if modRoot != "" {
 		base = modRoot
@@ -94,10 +91,28 @@ func (p *proxy) unitFor(path string) (string, bool) {
 		return "", false
 	}
 	prefix = filepath.ToSlash(prefix)
-	if unit == "." {
-		return prefix, true
+	return prefixUnit(prefix, unit), true
+}
+
+// modRootFor is a nil-safe wrapper around p.modRoots.RootFor: a nil
+// moduleRootCache (nested-module detection unset) is treated as "no nested
+// modules", matching the doc comment on the proxy.modRoots field.
+func (p *proxy) modRootFor(dir, root string) string {
+	if p.modRoots == nil {
+		return ""
 	}
-	return prefix + "/" + unit, true
+	return p.modRoots.RootFor(dir, root)
+}
+
+// prefixUnit joins a nested module's root-relative prefix with one of its
+// own scope units, collapsing the module-root sentinel "." to the bare
+// prefix — the same rule unitFor applies when mapping a file directly in the
+// module's root.
+func prefixUnit(prefix, unit string) string {
+	if unit == "." {
+		return prefix
+	}
+	return prefix + "/" + unit
 }
 
 // pushScope tells gopls that configuration changed; gopls then re-requests
