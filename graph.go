@@ -512,14 +512,16 @@ func (g *graphServer) handle(conn net.Conn) {
 
 var notHandled = []byte(`{"NotHandled":true}`)
 
-// answer dispatches a driver query to the slot owning its directory: the
-// main workspace slot, or a nested module's own subslot (e.g. a git
-// worktree with its own go.mod). The dispatch runs BEFORE any cache-hit
-// check, which matters: dirCompatible alone is a string-prefix test, so a
-// nested module's Dir would otherwise wrongly prefix-match the main slot's
-// cached dir (which, right after startup, is often the workspace root
-// itself — every subdirectory string-prefix-matches that) and be served the
-// wrong, main-workspace graph.
+// answer dispatches a driver query to the slot owning it: the main workspace
+// slot, or a nested module's own subslot (e.g. a git worktree with its own
+// go.mod). The dispatch runs BEFORE any cache-hit check, which matters:
+// dirCompatible alone is a string-prefix test, so a nested module's Dir would
+// otherwise wrongly prefix-match the main slot's cached dir (which, right
+// after startup, is often the workspace root itself — every subdirectory
+// string-prefix-matches that) and be served the wrong, main-workspace graph.
+//
+// A nested module's subslot answers differently from the main slot
+// (answerNestedSlot, not answerSlot): see resolveModRootForQuery for why.
 func (g *graphServer) answer(q driverQuery) []byte {
 	var req packages.DriverRequest
 	if err := json.Unmarshal(q.Request, &req); err != nil {
@@ -527,12 +529,12 @@ func (g *graphServer) answer(q driverQuery) []byte {
 	}
 	key := strings.Join(q.Patterns, "\x00")
 
-	modRoot := g.resolveModRoot(q.Dir)
+	modRoot := g.resolveModRootForQuery(q)
 	if modRoot == "" {
 		return g.answerSlot(&g.main, g.idx, q, req, key, true)
 	}
 	slot, idx := g.subslotFor(modRoot)
-	return g.answerSlot(slot, idx, q, req, key, false)
+	return g.answerNestedSlot(slot, idx, modRoot, q, req)
 }
 
 // resolveModRoot resolves which module owns a driver query's directory: ""
@@ -551,6 +553,43 @@ func (g *graphServer) resolveModRoot(dir string) string {
 		return ""
 	}
 	return g.modRoots.RootFor(dir, root)
+}
+
+// resolveModRootForQuery resolves which nested module a driver query belongs
+// to, like resolveModRoot, but also inspects the query's own "file=" pattern
+// targets when Dir does not resolve to one.
+//
+// gopls, once a GOPACKAGESDRIVER is configured, loads the whole workspace
+// through a single view rooted at the workspace folder — it does not create
+// gopls's usual per-module zero-config view for a nested go.mod the way it
+// does without a driver — and it invokes the driver with Dir always set to
+// that one view's root, even for a query whose target file lives inside a
+// nested module's own go.mod boundary. So Dir alone cannot be trusted to
+// route a nested module's queries to its own subslot; the "file=" pattern
+// arguments, which name the actual target file, are the only reliable signal
+// in that case.
+func (g *graphServer) resolveModRootForQuery(q driverQuery) string {
+	if modRoot := g.resolveModRoot(q.Dir); modRoot != "" {
+		return modRoot
+	}
+	for _, f := range queryFileTargets(q.Patterns) {
+		if modRoot := g.resolveModRoot(filepath.Dir(f)); modRoot != "" {
+			return modRoot
+		}
+	}
+	return ""
+}
+
+// queryFileTargets extracts the absolute file paths named by "file=" driver
+// query patterns (see golang.org/x/tools/go/packages' query pattern syntax).
+func queryFileTargets(patterns []string) []string {
+	var files []string
+	for _, p := range patterns {
+		if f, ok := strings.CutPrefix(p, "file="); ok {
+			files = append(files, f)
+		}
+	}
+	return files
 }
 
 // subslotFor returns the lazily-created subslot and owning-module index for
@@ -639,6 +678,94 @@ func (g *graphServer) answerSlot(slot *graphSlot, idx *revIndex, q driverQuery, 
 	} else {
 		g.log.Printf("driver: served %d patterns from cache (%d bytes)", len(q.Patterns), len(resp))
 	}
+	return resp
+}
+
+// nestedModuleCacheKey is the fixed patternsKey every subslot build is
+// stored under, regardless of which literal pattern the query that triggered
+// it asked for. A subslot always answers with the WHOLE nested module's
+// package graph (built from the "all" pattern, see nestedModuleLoadPattern):
+// nested modules are small (a git worktree is a tiny slice of the
+// monorepo), so loading the whole thing once is cheap and lets every
+// subsequent query for that module — whatever its own pattern — hit the same
+// cache, instead of rebuilding per distinct pattern.
+const nestedModuleCacheKey = "nested:all"
+
+// nestedModuleLoadPattern is the pattern every subslot build uses, regardless
+// of the query pattern that triggered it — see nestedModuleCacheKey. "all"
+// (every package in the module rooted at the build dir, plus its
+// dependencies) rather than "./..." because a driver query's own build dir is
+// always the nested module's own root (see resolveModRootForQuery), so the
+// two are equivalent for this purpose.
+var nestedModuleLoadPattern = []string{"all"}
+
+// answerNestedSlot answers a query dispatched to a nested module's subslot.
+//
+// Unlike answerSlot (the main slot), a cache miss here cannot defer to
+// NotHandled and trust gopls's own native `go list` fallback: gopls, in
+// GOPACKAGESDRIVER mode, keeps a single view rooted at the workspace folder
+// and runs that fallback from there too, so it can never resolve a file
+// belonging to a different module's go.mod (see resolveModRootForQuery). A
+// synchronous build is the only way to answer such a query correctly;
+// acceptable because nested modules are small.
+func (g *graphServer) answerNestedSlot(slot *graphSlot, idx *revIndex, modRoot string, q driverQuery, req packages.DriverRequest) []byte {
+	g.mu.Lock()
+	resp := slot.resp
+	stale := slot.stale
+	hasCache := resp != nil
+	g.mu.Unlock()
+
+	if hasCache {
+		return g.answerNestedSlotFromCache(slot, idx, modRoot, q, req, resp, stale)
+	}
+
+	g.mu.Lock()
+	building := slot.building
+	if !building {
+		slot.building = true
+	}
+	g.mu.Unlock()
+	if building {
+		g.log.Printf("driver: nested module %s build already in progress; NotHandled", modRoot)
+		return notHandled
+	}
+
+	g.buildSlot(slot, nestedModuleLoadPattern, modRoot, nestedModuleCacheKey, false)
+
+	g.mu.Lock()
+	resp = slot.resp
+	g.mu.Unlock()
+	if resp == nil {
+		g.log.Printf("driver: nested module %s build failed; NotHandled", modRoot)
+		return notHandled
+	}
+	return resp
+}
+
+// answerNestedSlotFromCache answers a nested-module subslot query that
+// already has a cached graph: fresh cache is served as-is; a dirty overlay
+// falls back to NotHandled (the cached snapshot cannot reflect unsaved
+// import changes); a stale cache (go.mod / imports changed on disk) is still
+// served immediately, with a background rebuild kicked off at most once.
+func (g *graphServer) answerNestedSlotFromCache(slot *graphSlot, idx *revIndex, modRoot string, q driverQuery, req packages.DriverRequest, resp []byte, stale bool) []byte {
+	if g.overlayDirty(idx, req.Overlay) {
+		g.log.Printf("driver: nested module %s overlay changes imports, falling back to go list", modRoot)
+		return notHandled
+	}
+	if !stale {
+		g.log.Printf("driver: served %d patterns from nested-module cache (module %s, %d bytes)", len(q.Patterns), modRoot, len(resp))
+		return resp
+	}
+	g.mu.Lock()
+	building := slot.building
+	if !building {
+		slot.building = true
+	}
+	g.mu.Unlock()
+	if !building {
+		go g.buildSlot(slot, nestedModuleLoadPattern, modRoot, nestedModuleCacheKey, false)
+	}
+	g.log.Printf("driver: served %d patterns from stale nested-module cache (module %s, rebuild in progress)", len(q.Patterns), modRoot)
 	return resp
 }
 

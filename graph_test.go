@@ -405,6 +405,12 @@ func TestGraphServer_IsEmbedFile(t *testing.T) {
 // top of answer(), run BEFORE any hasCache/dirCompatible check, is what
 // prevents this; this test would fail if that dispatch were removed or
 // reordered after the dirCompatible check.
+//
+// A nested module's subslot answers with its own, synchronously built graph
+// (answerNestedSlot) rather than NotHandled — see the doc comment on
+// answerNestedSlot for why a cache miss cannot defer to gopls's own native go
+// list fallback the way the main slot's can — so this pins "the response is
+// not the main slot's cached bytes", not "the response is NotHandled".
 func TestGraphServer_Answer_SubslotDispatch_NeverServedFromMainCache(t *testing.T) {
 	root := t.TempDir()
 	modDir := filepath.Join(root, "wt", "nested")
@@ -414,12 +420,13 @@ func TestGraphServer_Answer_SubslotDispatch_NeverServedFromMainCache(t *testing.
 		t.Fatal("test setup invalid: dirCompatible must consider modDir compatible with the main dir for this regression pin to be meaningful")
 	}
 
+	mainResp := []byte(`{"Packages":[{"GoFiles":["` + root + `/pkg/a.go"]}]}`)
 	g := &graphServer{
 		log:      log.New(io.Discard, "", 0),
 		root:     root,
 		modRoots: &moduleRootCache{},
 		main: graphSlot{
-			resp:        []byte(`{"Packages":[{"GoFiles":["` + root + `/pkg/a.go"]}]}`),
+			resp:        mainResp,
 			patternsKey: "./...",
 			patterns:    []string{"./..."},
 			dir:         root,
@@ -427,18 +434,22 @@ func TestGraphServer_Answer_SubslotDispatch_NeverServedFromMainCache(t *testing.
 	}
 
 	got := g.answer(driverQuery{Patterns: []string{"./..."}, Dir: modDir, Request: json.RawMessage(`{}`)})
-	if !bytes.Equal(got, notHandled) {
-		t.Errorf("answer(nested module dir) = %s, want NotHandled (must not be served from the main slot's cache)", got)
+	if bytes.Equal(got, mainResp) {
+		t.Error("answer(nested module dir) returned the main slot's cached bytes, want the nested module's own graph")
+	}
+	if bytes.Equal(got, notHandled) {
+		t.Error("answer(nested module dir) = NotHandled, want a synchronously built response for the nested module")
 	}
 
 	g.mu.Lock()
 	_, gotSubslot := g.subslots[modDir]
 	mainDirUnchanged := g.main.dir == root
+	mainRespUnchanged := bytes.Equal(g.main.resp, mainResp)
 	g.mu.Unlock()
 	if !gotSubslot {
 		t.Error("answer did not dispatch the nested-module query to its own subslot")
 	}
-	if !mainDirUnchanged {
+	if !mainDirUnchanged || !mainRespUnchanged {
 		t.Error("answer mutated the main slot while serving a nested-module query")
 	}
 }
