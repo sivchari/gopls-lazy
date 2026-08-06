@@ -49,8 +49,18 @@ func setFilters(settings map[string]any, filters []string) {
 }
 
 // unitFor maps an absolute file path to its scope unit relative to the
-// workspace root.  Files that live directly in the workspace root are mapped
+// workspace root. Files that live directly in the workspace root are mapped
 // to the special unit "." (the root).
+//
+// Files inside a nested Go module (e.g. a git worktree with its own go.mod
+// anywhere under the workspace root, detected purely by p.modRoots) are
+// instead mapped relative to that module's own root, then prefixed with the
+// module's root-relative path. This is required because gopls always
+// evaluates directoryFilters relative to the workspace folder root: a bare
+// module-relative unit would never match and gopls would drop the package.
+// A file directly in the nested module's root must never collapse to unit
+// "." — filtersLocked treats "." as "drop all filters", which would be
+// wrong for anything but the main module's own root.
 func (p *proxy) unitFor(path string) (string, bool) {
 	p.mu.Lock()
 	root := p.root
@@ -58,16 +68,36 @@ func (p *proxy) unitFor(path string) (string, bool) {
 	if root == "" || !strings.HasPrefix(path, root+string(filepath.Separator)) {
 		return "", false
 	}
-	rel, err := filepath.Rel(root, filepath.Dir(path))
+	dir := filepath.Dir(path)
+	var modRoot string
+	if p.modRoots != nil {
+		modRoot = p.modRoots.RootFor(dir, root)
+	}
+	base := root
+	if modRoot != "" {
+		base = modRoot
+	}
+	rel, err := filepath.Rel(base, dir)
 	if err != nil || strings.HasPrefix(rel, "..") {
 		return "", false
 	}
-	if rel == "." {
-		// File is directly in the workspace root (e.g. main.go in a small
-		// single-package repo). Represent it as the root unit ".".
-		return ".", true
+	unit := "."
+	if rel != "." {
+		unit = scopeUnit(filepath.ToSlash(rel), p.opts.granularity)
 	}
-	return scopeUnit(filepath.ToSlash(rel), p.opts.granularity), true
+	if modRoot == "" {
+		return unit, true
+	}
+	prefix, err := filepath.Rel(root, modRoot)
+	if err != nil {
+		// modRoot is guaranteed to be under root by construction of RootFor.
+		return "", false
+	}
+	prefix = filepath.ToSlash(prefix)
+	if unit == "." {
+		return prefix, true
+	}
+	return prefix + "/" + unit, true
 }
 
 // pushScope tells gopls that configuration changed; gopls then re-requests
@@ -353,6 +383,16 @@ func (p *proxy) saveScope() {
 	}
 }
 
+// unitDirExists reports whether the directory a saved scope unit points to
+// still exists under root. unit is a root-relative slash path, possibly ".".
+func unitDirExists(root, unit string) bool {
+	if unit == "." {
+		return true
+	}
+	info, err := os.Stat(filepath.Join(root, filepath.FromSlash(unit)))
+	return err == nil && info.IsDir()
+}
+
 // restoreScope loads the previously saved scope into p.scope so the initial
 // directoryFilters include the services the user was editing last session.
 // Must be called before patchInitialize sends the first filters to gopls.
@@ -369,6 +409,12 @@ func (p *proxy) restoreScope(root string) {
 	}
 	p.mu.Lock()
 	for _, u := range saved.Units {
+		if !unitDirExists(root, u) {
+			// The directory behind this unit (e.g. a worktree) was removed
+			// between sessions; restoring it would make gopls reject a
+			// directoryFilters pattern for a non-existent path.
+			continue
+		}
 		if _, exists := p.scope[u]; !exists {
 			p.scope[u] = &scopeEntry{open: map[string]bool{}, lastActive: time.Now()}
 		}
