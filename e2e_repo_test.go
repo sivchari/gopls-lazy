@@ -140,6 +140,76 @@ func main() {
 	return root, locs
 }
 
+// nestedLocs records the exact 0-based positions the nested-worktree-module
+// E2E subtests query, captured while the nested module is written so nothing
+// is re-parsed at query time. See writeMonorepoWithNestedWorktree.
+type nestedLocs struct {
+	pkgAFile string      // nested module's pkg/a/a.go
+	sumDecl  lspPosition // "Sum" in the nested module's own "func Sum(a, b int) int"
+
+	pkgBFile    string      // nested module's pkg/b/b.go
+	sumCall     lspPosition // "Sum" in the a.Sum(...) call inside pkg/b
+	pkgBEndLine int         // 0-based index of pkg/b/b.go's last line, for a full-file range
+}
+
+// writeMonorepoWithNestedWorktree extends writeMonorepo with a second,
+// independent Go module nested under a dot-directory of the same root — e.g.
+// a git worktree checked out at ".claude/worktrees/wt1". The path shape
+// (dot-dir) is illustrative only: nested-module detection (moduleRootCache,
+// see modroot.go) walks upward from an opened file looking for the nearest
+// go.mod and is entirely path-shape-agnostic. This exercises the
+// historically suspicious dot-dir case without the code depending on it.
+//
+// The nested module needs no go.work file and no git worktree metadata to
+// trigger gopls's zero-config view creation: a plain go.mod under the
+// workspace folder is the whole trigger.
+//
+// pkg/a exports Sum, deliberately sharing its name with lib/util.Sum in the
+// main fixture (repoLocs) so a references query rooted in the main module can
+// be pinned to never surface the nested module's call site: the two Sums are
+// different symbols in different packages/modules, so a correct answer
+// naturally excludes the nested one even though the name collides
+// textually.
+//
+// Since this fixture lives under a non-git t.TempDir(), graphCacheKey's
+// git-common-dir resolution (see graph.go) falls through to its second
+// fallback, the main module's own go.mod module path — expected and harmless
+// here since none of these tests exercise the on-disk graph cache.
+func writeMonorepoWithNestedWorktree(t *testing.T) (string, repoLocs, nestedLocs) {
+	t.Helper()
+	root, repo := writeMonorepo(t)
+
+	var nested nestedLocs
+
+	writeRepoFile(t, root, ".claude/worktrees/wt1/go.mod", "module example.com/wt1\n\ngo 1.21\n")
+
+	const aSrc = `package a
+
+// Sum adds two ints. Same name as example.com/mono/lib/util.Sum, on purpose:
+// see writeMonorepoWithNestedWorktree.
+func Sum(a, b int) int {
+	return a + b
+}
+`
+	nested.pkgAFile = writeRepoFile(t, root, ".claude/worktrees/wt1/pkg/a/a.go", aSrc)
+	nested.sumDecl = mustPos(t, aSrc, "func Sum", "Sum")
+
+	const bSrc = `package b
+
+import "example.com/wt1/pkg/a"
+
+// Call invokes the nested module's own Sum.
+func Call() int {
+	return a.Sum(1, 2)
+}
+`
+	nested.pkgBFile = writeRepoFile(t, root, ".claude/worktrees/wt1/pkg/b/b.go", bSrc)
+	nested.sumCall = mustPos(t, bSrc, "a.Sum(", "Sum")
+	nested.pkgBEndLine = len(strings.Split(bSrc, "\n")) - 1
+
+	return root, repo, nested
+}
+
 func writeRepoFile(t *testing.T, root, rel, content string) string {
 	t.Helper()
 	path := filepath.Join(root, filepath.FromSlash(rel))
