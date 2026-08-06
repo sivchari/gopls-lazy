@@ -110,6 +110,49 @@ func TestSameImports(t *testing.T) {
 	}
 }
 
+// TestBuild_StopsAtModuleBoundary verifies Build never descends into a
+// directory that itself contains a go.mod: that directory belongs to a
+// different module and is served by its own index (see indexFor), not the
+// outer one. This applies regardless of the nested directory's name (a
+// visible "nested" dir here, not a dot-dir), since the rule is purely
+// go.mod-presence-based like moduleRootCache.
+func TestBuild_StopsAtModuleBoundary(t *testing.T) {
+	root := t.TempDir()
+	write := func(base, rel, src string) {
+		path := filepath.Join(base, rel)
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(src), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(root, "go.mod", "module example.com/mod\n\ngo 1.26\n")
+	write(root, "go/pkg/base/base.go", "package base\n")
+
+	nestedRoot := filepath.Join(root, "nested")
+	write(root, "nested/go.mod", "module example.com/nested\n\ngo 1.26\n")
+	write(root, "nested/pkg/x.go", "package x\n\nfunc NestedOnly() {}\n")
+
+	outer := newRevIndex(log.New(io.Discard, "", 0))
+	outer.Build(root)
+	if !outer.Ready() {
+		t.Fatal("outer index not ready after Build")
+	}
+	if got := outer.WorkspaceSymbols("NestedOnly"); len(got) != 0 {
+		t.Errorf("outer index indexed a file belonging to a nested module: %#v", got)
+	}
+
+	inner := newRevIndex(log.New(io.Discard, "", 0))
+	inner.Build(nestedRoot)
+	if !inner.Ready() {
+		t.Fatal("inner index not ready after Build")
+	}
+	if got := inner.WorkspaceSymbols("NestedOnly"); len(got) != 1 {
+		t.Errorf("inner index built directly on the nested module root should index it, got %#v", got)
+	}
+}
+
 func TestUpdateFileChangeDetection(t *testing.T) {
 	ri := buildTestIndex(t)
 	path := filepath.Join(ri.root, "go", "services", "c", "main.go")

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -649,5 +651,104 @@ func TestPatchConfigResponse_StripsUserFilterVariants(t *testing.T) {
 		if _, ok := workerItem[k]; ok {
 			t.Errorf("worker config should not contain %s", k)
 		}
+	}
+}
+
+func TestIndexFor_EmptyModRootReturnsMainIndex(t *testing.T) {
+	p, _ := newTestProxy()
+	p.idx = newRevIndex(log.New(io.Discard, "", 0))
+
+	if got := p.indexFor(""); got != p.idx {
+		t.Fatalf("indexFor(\"\") = %p, want p.idx %p", got, p.idx)
+	}
+}
+
+// TestIndexFor_LazyBuildsAndDedupsNestedModule verifies indexFor creates a
+// dedicated sub-index for a never-seen module root, builds it in the
+// background, and returns the SAME instance on a second call (no duplicate
+// build).
+func TestIndexFor_LazyBuildsAndDedupsNestedModule(t *testing.T) {
+	p, _ := newTestProxy()
+	p.idx = newRevIndex(log.New(io.Discard, "", 0))
+
+	modRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(modRoot, "go.mod"), []byte("module example.com/nested\n\ngo 1.26\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(modRoot, "x.go"), []byte("package x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	first := p.indexFor(modRoot)
+	if first == p.idx {
+		t.Fatal("indexFor(modRoot) returned the main index, want a dedicated sub-index")
+	}
+	if !first.WaitReady(2 * time.Second) {
+		t.Fatal("sub-index did not become ready")
+	}
+	if first.root != modRoot {
+		t.Fatalf("sub-index root = %q, want %q", first.root, modRoot)
+	}
+
+	second := p.indexFor(modRoot)
+	if second != first {
+		t.Fatal("indexFor(modRoot) called twice returned different instances, want the same cached instance (no duplicate build)")
+	}
+}
+
+// TestInterceptWorkspaceSymbol_MergesSubIndexes proves interceptWorkspaceSymbol
+// queries the main index and every ready sub-index and merges their results,
+// instead of answering from the main index alone.
+func TestInterceptWorkspaceSymbol_MergesSubIndexes(t *testing.T) {
+	p, _ := newTestProxy()
+	clientBuf := &syncBuffer{}
+	p.toClient = newFrameWriter(clientBuf)
+	p.root = t.TempDir()
+
+	mainRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(mainRoot, "go.mod"), []byte("module example.com/main\n\ngo 1.26\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mainRoot, "a.go"), []byte("package a\n\nfunc AlphaOnly() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p.idx = newRevIndex(log.New(io.Discard, "", 0))
+	p.idx.Build(mainRoot)
+	if !p.idx.WaitReady(2 * time.Second) {
+		t.Fatal("main index did not become ready")
+	}
+
+	subRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(subRoot, "go.mod"), []byte("module example.com/nested\n\ngo 1.26\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(subRoot, "b.go"), []byte("package b\n\nfunc BetaOnly() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sub := newRevIndex(log.New(io.Discard, "", 0))
+	sub.Build(subRoot)
+	if !sub.WaitReady(2 * time.Second) {
+		t.Fatal("sub-index did not become ready")
+	}
+	p.subIdx = map[string]*revIndex{subRoot: sub}
+
+	raw := []byte(`{"jsonrpc":"2.0","id":1,"method":"workspace/symbol","params":{"query":""}}`)
+	var m message
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	if !p.interceptWorkspaceSymbol(raw, &m) {
+		t.Fatal("interceptWorkspaceSymbol did not take over the request")
+	}
+
+	waitFor(t, 2*time.Second, "workspace/symbol response written", func() bool {
+		return clientBuf.String() != ""
+	})
+	out := clientBuf.String()
+	if !strings.Contains(out, "AlphaOnly") {
+		t.Errorf("response missing main-index symbol AlphaOnly: %s", out)
+	}
+	if !strings.Contains(out, "BetaOnly") {
+		t.Errorf("response missing sub-index symbol BetaOnly: %s", out)
 	}
 }

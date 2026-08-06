@@ -65,6 +65,9 @@ type proxy struct {
 	graph    *graphServer
 	modRoots *moduleRootCache // nested (e.g. worktree) go.mod detection for unitFor; nil is treated as "no nested modules"
 
+	subIdxMu sync.Mutex           // guards subIdx only; kept separate from p.mu, matching the per-concern locking used elsewhere
+	subIdx   map[string]*revIndex // nested module root -> its own reverse-import index, built lazily via indexFor
+
 	toServer *frameWriter
 	toClient *frameWriter
 	log      *log.Logger
@@ -432,12 +435,34 @@ func (p *proxy) interceptWorkspaceSymbol(raw []byte, m *message) bool {
 	query := params.Query
 	held := append([]byte(nil), raw...)
 	go func() {
-		if !p.idx.WaitReady(10 * time.Second) {
+		// A single 10s budget covers the main index and every sub-index below,
+		// so N nested modules never turn a 10s budget into N*10s.
+		deadline := time.Now().Add(10 * time.Second)
+		if !p.idx.WaitReady(time.Until(deadline)) {
 			p.log.Printf("workspace/symbol: index not ready in time, forwarding to gopls")
 			p.toServer.write(held)
 			return
 		}
-		symbols := p.idx.WorkspaceSymbols(query)
+		results := [][]workspaceSymbol{p.idx.WorkspaceSymbols(query)}
+
+		p.subIdxMu.Lock()
+		subs := make([]*revIndex, 0, len(p.subIdx))
+		for _, ri := range p.subIdx {
+			subs = append(subs, ri)
+		}
+		p.subIdxMu.Unlock()
+
+		for _, ri := range subs {
+			remaining := time.Until(deadline)
+			if remaining <= 0 || !ri.WaitReady(remaining) {
+				// Not ready within the shared budget: skip it rather than block
+				// further, so one slow-building sub-index cannot stall the rest.
+				continue
+			}
+			results = append(results, ri.WorkspaceSymbols(query))
+		}
+
+		symbols := mergeWorkspaceSymbols(results...)
 		p.respond(id, symbols)
 		p.log.Printf("workspace/symbol: query=%q results=%d", query, len(symbols))
 	}()
@@ -764,6 +789,24 @@ func (p *proxy) diagArrived(uri, why string) {
 // observeFileEvent keeps the reverse-import index and the package-graph
 // cache in sync with on-disk changes (saves, git operations seen by the
 // editor's file watcher).
+// invalidateModuleBoundary drops caches that go stale when a go.mod at path
+// appears or disappears: the module-root cache (every cached RootFor answer
+// may now be wrong) and the subIdx entry keyed by this go.mod's own
+// directory (the module root it defines). The subIdx entry is stale either
+// way — dropping it here makes it lazily rebuild on next access via
+// indexFor, whether the module just appeared (no entry yet, a harmless
+// no-op delete) or just disappeared (the entry indexed a module that no
+// longer exists).
+func (p *proxy) invalidateModuleBoundary(gomodPath string) {
+	if p.modRoots != nil {
+		p.modRoots.Invalidate()
+	}
+	modDir := filepath.Dir(gomodPath)
+	p.subIdxMu.Lock()
+	delete(p.subIdx, modDir)
+	p.subIdxMu.Unlock()
+}
+
 func (p *proxy) observeFileEvent(uri string) {
 	path := uriToPath(uri)
 	if path == "" {
@@ -776,10 +819,7 @@ func (p *proxy) observeFileEvent(uri string) {
 		return
 	}
 	base := filepath.Base(path)
-	if base == "go.mod" || base == "go.sum" || base == "go.work" || base == "go.work.sum" {
-		if p.graph != nil {
-			p.graph.MarkStale("module file changed: " + base)
-		}
+	if p.handleModuleFileEvent(path, base) {
 		return
 	}
 	if !strings.HasSuffix(path, ".go") {
@@ -792,12 +832,39 @@ func (p *proxy) observeFileEvent(uri string) {
 		}
 		return
 	}
-	go func() {
-		changed := p.idx.UpdateFile(path)
-		if changed && p.graph != nil {
-			p.graph.MarkStale("imports or embed directives changed: " + path)
-		}
-	}()
+	go p.updateFileInIndex(path, root)
+}
+
+// handleModuleFileEvent handles a save/watch event for a module-defining
+// file (go.mod, go.sum, go.work, go.work.sum), invalidating the caches that
+// depend on it. It reports whether path was such a file (and was therefore
+// handled and requires no further processing by observeFileEvent).
+func (p *proxy) handleModuleFileEvent(path, base string) bool {
+	if base != "go.mod" && base != "go.sum" && base != "go.work" && base != "go.work.sum" {
+		return false
+	}
+	if base == "go.mod" {
+		p.invalidateModuleBoundary(path)
+	}
+	if p.graph != nil {
+		p.graph.MarkStale("module file changed: " + base)
+	}
+	return true
+}
+
+// updateFileInIndex re-parses a changed .go file in the reverse-import index
+// that owns its module (see indexFor) and marks the package graph stale if
+// its import or embed footprint changed. Run in a goroutine by
+// observeFileEvent.
+func (p *proxy) updateFileInIndex(path, root string) {
+	var modRoot string
+	if p.modRoots != nil {
+		modRoot = p.modRoots.RootFor(filepath.Dir(path), root)
+	}
+	changed := p.indexFor(modRoot).UpdateFile(path)
+	if changed && p.graph != nil {
+		p.graph.MarkStale("imports or embed directives changed: " + path)
+	}
 }
 
 func (p *proxy) observeWatchedFiles(params json.RawMessage) {
