@@ -184,6 +184,15 @@ func (p *proxy) interceptClientRequest(raw []byte, m *message) bool {
 		return p.interceptDefinition(raw, m)
 	case m.Method == methodPrepareRename:
 		return p.interceptPrepareRename(raw, m)
+	case m.Method == methodInlayHint, m.Method == methodHover:
+		// Editors fire these right after didOpen. In gopls's orphan mode (the
+		// file's unit not yet applied) both return a JSON-RPC error ("no
+		// package metadata for file") instead of degrading gracefully, which
+		// editors like vim surface as a blocking error dialog on every open.
+		// Confirmed empirically against real gopls; documentSymbol,
+		// foldingRange, semanticTokens, codeLens, documentHighlight and
+		// signatureHelp all succeed in orphan mode and must stay off this path.
+		return p.holdForRequestUnit(raw, m, 15*time.Second)
 	case isCrossRef(m.Method):
 		return p.interceptCrossRef(raw, m)
 	default:

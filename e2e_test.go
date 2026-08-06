@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"sort"
 	"testing"
+	"time"
 )
 
 // skipUnlessE2E skips the end-to-end suite in -short mode and when the real
@@ -91,13 +92,85 @@ func TestE2E(t *testing.T) {
 	})
 }
 
+// TestE2EOrphanWindowRequests reproduces the "no package metadata" errors an
+// editor gets when it fires requests immediately after didOpen, before the
+// rescope that widens gopls's directoryFilters to the new file's unit has
+// completed (github issue: vim's blocking "Press ENTER" on every open).
+//
+// inlayHint and hover errored against real gopls in this window before the
+// fix (confirmed empirically); this test pins that they now succeed. The
+// parse-only requests must stay instant and unheld, so they are queried the
+// same way as a control.
+func TestE2EOrphanWindowRequests(t *testing.T) {
+	skipUnlessE2E(t)
+
+	root, locs := writeMonorepo(t)
+	c := startProxy(t, root)
+	c.initialize(t, root)
+	c.openFile(t, locs.svc05File)
+	// Let the first unit's rescope complete so opening the next file is a
+	// genuine widen into a second, not-yet-applied unit.
+	time.Sleep(3 * time.Second)
+
+	// Open a file in a different scope unit and immediately query it, before
+	// the rescope that would apply that unit has any chance to complete.
+	c.openFile(t, locs.svc17File)
+
+	docParams := textDocumentParams(locs.svc17File)
+	inlayParams := textDocumentParams(locs.svc17File)
+	inlayParams["range"] = lspRange{Start: lspPosition{Line: 0, Character: 0}, End: lspPosition{Line: 20, Character: 0}}
+
+	t.Run("inlayHint", func(t *testing.T) {
+		resp := c.call(t, methodInlayHint, inlayParams, e2eBudget(e2eDefinitionBudget))
+		if len(resp.Error) > 0 {
+			t.Fatalf("inlayHint errored in the orphan window: %s", resp.Error)
+		}
+	})
+	t.Run("hover", func(t *testing.T) {
+		resp := c.call(t, methodHover, positionParams(locs.svc17File, locs.svc17SumCall, nil), e2eBudget(e2eDefinitionBudget))
+		if len(resp.Error) > 0 {
+			t.Fatalf("hover errored in the orphan window: %s", resp.Error)
+		}
+		if len(resp.Result) == 0 || string(resp.Result) == "null" {
+			t.Fatalf("hover on util.Sum returned no content: %s", resp.Result)
+		}
+	})
+
+	// Control: parse-only requests must remain unheld and answer instantly
+	// even in the same orphan window.
+	t.Run("documentSymbol_stays_instant", func(t *testing.T) {
+		start := time.Now()
+		resp := c.call(t, "textDocument/documentSymbol", docParams, e2eBudget(e2eDefinitionBudget))
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("documentSymbol took %s in the orphan window, want instant (must not be held)", elapsed)
+		}
+		if len(resp.Error) > 0 {
+			t.Fatalf("documentSymbol errored: %s", resp.Error)
+		}
+	})
+	t.Run("foldingRange_stays_instant", func(t *testing.T) {
+		start := time.Now()
+		resp := c.call(t, "textDocument/foldingRange", docParams, e2eBudget(e2eDefinitionBudget))
+		if elapsed := time.Since(start); elapsed > time.Second {
+			t.Fatalf("foldingRange took %s in the orphan window, want instant (must not be held)", elapsed)
+		}
+		if len(resp.Error) > 0 {
+			t.Fatalf("foldingRange errored: %s", resp.Error)
+		}
+	})
+}
+
+// textDocumentParams builds the textDocument-only request params shared by
+// document-scoped methods (documentSymbol, foldingRange, inlayHint, ...).
+func textDocumentParams(path string) map[string]any {
+	return map[string]any{"textDocument": textDocumentIdentifier{URI: pathToURI(path)}}
+}
+
 // positionParams builds textDocument/position request params; refCtx adds the
 // references-specific context member when non-nil.
 func positionParams(path string, pos lspPosition, refCtx map[string]any) map[string]any {
-	params := map[string]any{
-		"textDocument": textDocumentIdentifier{URI: pathToURI(path)},
-		"position":     pos,
-	}
+	params := textDocumentParams(path)
+	params["position"] = pos
 	if refCtx != nil {
 		params["context"] = refCtx
 	}

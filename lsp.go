@@ -13,6 +13,8 @@ const (
 	methodPrepareRename         = "textDocument/prepareRename"
 	methodReferences            = "textDocument/references"
 	methodImplementation        = "textDocument/implementation"
+	methodInlayHint             = "textDocument/inlayHint"
+	methodHover                 = "textDocument/hover"
 	methodShowMessage           = "window/showMessage"
 	methodConfiguration         = "workspace/configuration"
 	methodDidChangeWatchedFiles = "workspace/didChangeWatchedFiles"
