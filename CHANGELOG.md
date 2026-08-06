@@ -1,5 +1,11 @@
 # Changelog
 
+## [v0.4.0](https://github.com/sivchari/gopls-lazy/compare/v0.3.0...v0.4.0) - 2026-08-06
+- fix: make definition/references reliable with a persistent worker and config-generation barrier by @sivchari in https://github.com/sivchari/gopls-lazy/pull/12
+- fix: hold inlayHint and hover until the file's scope unit is applied by @sivchari in https://github.com/sivchari/gopls-lazy/pull/14
+- feat: support editing nested worktree modules from a single session by @sivchari in https://github.com/sivchari/gopls-lazy/pull/15
+- release v0.4.0 by @sivchari in https://github.com/sivchari/gopls-lazy/pull/16
+
 ## [v0.3.0](https://github.com/sivchari/gopls-lazy/compare/v0.2.0...v0.3.0) - 2026-07-03
 - fix: make definition/references work in git worktrees and own directoryFilters exclusively by @sivchari in https://github.com/sivchari/gopls-lazy/pull/9
 - release v0.3.0 by @sivchari in https://github.com/sivchari/gopls-lazy/pull/11
