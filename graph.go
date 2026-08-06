@@ -592,6 +592,32 @@ func queryFileTargets(patterns []string) []string {
 	return files
 }
 
+// subslotRoots returns a snapshot of the nested module roots that currently
+// have a subslot. Used by evictIdleModules alongside subIdx's own keys: the
+// two are usually in lockstep (subslotFor always calls indexFor), but are
+// tracked independently, so eviction sweeps both rather than assuming one
+// implies the other.
+func (g *graphServer) subslotRoots() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	roots := make([]string, 0, len(g.subslots))
+	for r := range g.subslots {
+		roots = append(roots, r)
+	}
+	return roots
+}
+
+// RemoveSlot drops a nested module's subslot — its cached DriverResponse and
+// embed-footprint bookkeeping — freeing the memory it holds. Used by
+// evictIdleModules to reclaim modules that have gone idle. A later query for
+// the same module lazily rebuilds the slot via subslotFor, exactly as for a
+// module never seen before.
+func (g *graphServer) RemoveSlot(modRoot string) {
+	g.mu.Lock()
+	delete(g.subslots, modRoot)
+	g.mu.Unlock()
+}
+
 // subslotFor returns the lazily-created subslot and owning-module index for
 // a nested module root. A second call for the same modRoot returns the same
 // slot.

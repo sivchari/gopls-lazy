@@ -817,27 +817,138 @@ func (p *proxy) observeClose(params json.RawMessage) {
 	}
 }
 
-// evictLoop drops scope units that have had no open files for the TTL.
+// evictLoop drops scope units that have had no open files for the TTL, then
+// any nested module whose scope units were just evicted (or never existed)
+// and which has no open document under its root.
 func (p *proxy) evictLoop() {
 	ttl := p.opts.evictTTL
 	tick := time.NewTicker(time.Minute)
 	defer tick.Stop()
 	for range tick.C {
-		now := time.Now()
-		p.mu.Lock()
-		changed := false
-		for unit, e := range p.scope {
-			if len(e.open) == 0 && now.Sub(e.lastActive) > ttl {
-				delete(p.scope, unit)
-				p.log.Printf("scope -= %s (idle %s)", unit, ttl)
-				changed = true
-			}
-		}
-		p.mu.Unlock()
-		if changed {
-			p.pushScope()
+		p.evictIdleUnits(ttl)
+		p.evictIdleModules()
+	}
+}
+
+// evictIdleUnits drops scope units that have had no open files for ttl. Split
+// out from evictLoop so tests can drive a sweep directly without waiting on
+// the real per-minute ticker.
+func (p *proxy) evictIdleUnits(ttl time.Duration) {
+	now := time.Now()
+	p.mu.Lock()
+	changed := false
+	for unit, e := range p.scope {
+		if len(e.open) == 0 && now.Sub(e.lastActive) > ttl {
+			delete(p.scope, unit)
+			p.log.Printf("scope -= %s (idle %s)", unit, ttl)
+			changed = true
 		}
 	}
+	p.mu.Unlock()
+	if changed {
+		p.pushScope()
+	}
+}
+
+// evictIdleModules drops the subIdx entry and graph subslot for every nested
+// module (e.g. a git worktree with its own go.mod) that currently has no
+// surviving scope unit and no open document under its root. It is memory-only
+// bookkeeping: a re-touch after eviction lazily rebuilds both via indexFor
+// and the graph subslot's own lazy-create-on-miss (subslotFor), exactly as
+// for a module never seen before.
+//
+// The open-docs check is authoritative and independent of the scope-unit
+// bookkeeping above: a file can in principle be open without contributing an
+// "active" scope entry in edge cases, and evicting a module out from under an
+// open file would break active edits, so p.openDocs is consulted directly
+// rather than inferred from scope-unit absence.
+//
+// moduleRootCache entries (p.modRoots) are deliberately left untouched here:
+// it caches per QUERIED DIRECTORY, not per module root, so there is no single
+// key corresponding to "this module" to drop without an O(n) scan-by-value
+// over the whole cache. Its entries never become wrong (go.mod presence
+// hasn't changed, only editor activity has), only unnecessary to keep, so
+// leaving them is harmless and a scan-and-remove would be over-engineering
+// for a cache that self-corrects.
+func (p *proxy) evictIdleModules() {
+	p.mu.Lock()
+	root := p.root
+	units := make([]string, 0, len(p.scope))
+	for u := range p.scope {
+		units = append(units, u)
+	}
+	docPaths := make([]string, 0, len(p.openDocs))
+	for _, doc := range p.openDocs {
+		docPaths = append(docPaths, uriToPath(doc.URI))
+	}
+	p.mu.Unlock()
+	if root == "" {
+		return
+	}
+
+	p.subIdxMu.Lock()
+	roots := make(map[string]bool, len(p.subIdx))
+	for r := range p.subIdx {
+		roots[r] = true
+	}
+	p.subIdxMu.Unlock()
+	if p.graph != nil {
+		for _, r := range p.graph.subslotRoots() {
+			roots[r] = true
+		}
+	}
+
+	for modRoot := range roots {
+		if docUnderModule(docPaths, modRoot) {
+			continue
+		}
+		prefix := moduleUnitPrefix(root, modRoot)
+		if prefix == "" || unitUnderModule(units, prefix) {
+			continue
+		}
+		p.subIdxMu.Lock()
+		delete(p.subIdx, modRoot)
+		p.subIdxMu.Unlock()
+		if p.graph != nil {
+			p.graph.RemoveSlot(modRoot)
+		}
+		p.log.Printf("module -= %s (idle, subIdx+graph subslot evicted)", modRoot)
+	}
+}
+
+// moduleUnitPrefix returns the root-relative slash path a nested module's own
+// scope units are prefixed with (see prefixUnit/unitFor), or "" when modRoot
+// is not (strictly) under root.
+func moduleUnitPrefix(root, modRoot string) string {
+	rel, err := filepath.Rel(root, modRoot)
+	if err != nil || rel == "." || strings.HasPrefix(rel, "..") {
+		return ""
+	}
+	return filepath.ToSlash(rel)
+}
+
+// unitUnderModule reports whether any scope unit in units belongs to the
+// nested module whose scope units are prefixed with prefix (see
+// moduleUnitPrefix/prefixUnit).
+func unitUnderModule(units []string, prefix string) bool {
+	for _, u := range units {
+		if u == prefix || strings.HasPrefix(u, prefix+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// docUnderModule reports whether any open document path lives at or under
+// modRoot. Mirrors the root-prefix check workerStateFor uses to scope
+// p.openDocs to a nested module's worker.
+func docUnderModule(docPaths []string, modRoot string) bool {
+	for _, path := range docPaths {
+		if path == modRoot || strings.HasPrefix(path, modRoot+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *proxy) onDiagnostics(params json.RawMessage) {

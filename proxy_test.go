@@ -752,3 +752,159 @@ func TestInterceptWorkspaceSymbol_MergesSubIndexes(t *testing.T) {
 		t.Errorf("response missing sub-index symbol BetaOnly: %s", out)
 	}
 }
+
+// TestEvictIdleModules_DropsIdleModule verifies that a nested module with no
+// surviving scope unit and no open document under its root has its subIdx
+// entry and graph subslot dropped by the sweep.
+func TestEvictIdleModules_DropsIdleModule(t *testing.T) {
+	p, _ := newTestProxy()
+	root := t.TempDir()
+	p.root = root
+	modRoot := filepath.Join(root, "wt", "nested")
+
+	p.subIdx = map[string]*revIndex{modRoot: newRevIndex(log.New(io.Discard, "", 0))}
+	p.graph = &graphServer{log: log.New(io.Discard, "", 0), subslots: map[string]*graphSlot{modRoot: {}}}
+
+	p.evictIdleModules()
+
+	p.subIdxMu.Lock()
+	_, stillIndexed := p.subIdx[modRoot]
+	p.subIdxMu.Unlock()
+	if stillIndexed {
+		t.Error("evictIdleModules did not drop the subIdx entry for an idle module")
+	}
+	p.graph.mu.Lock()
+	_, stillSlotted := p.graph.subslots[modRoot]
+	p.graph.mu.Unlock()
+	if stillSlotted {
+		t.Error("evictIdleModules did not drop the graph subslot for an idle module")
+	}
+}
+
+// TestEvictIdleModules_KeepsModuleWithOpenDoc verifies the open-docs check is
+// authoritative: a module with an open document under its root is never
+// dropped, even though it has no scope unit at all.
+func TestEvictIdleModules_KeepsModuleWithOpenDoc(t *testing.T) {
+	p, _ := newTestProxy()
+	root := t.TempDir()
+	p.root = root
+	modRoot := filepath.Join(root, "wt", "nested")
+	openPath := filepath.Join(modRoot, "a.go")
+	uri := pathToURI(openPath)
+	p.openDocs[uri] = openDoc{URI: uri}
+
+	p.subIdx = map[string]*revIndex{modRoot: newRevIndex(log.New(io.Discard, "", 0))}
+	p.graph = &graphServer{log: log.New(io.Discard, "", 0), subslots: map[string]*graphSlot{modRoot: {}}}
+
+	p.evictIdleModules()
+
+	p.subIdxMu.Lock()
+	_, stillIndexed := p.subIdx[modRoot]
+	p.subIdxMu.Unlock()
+	if !stillIndexed {
+		t.Error("evictIdleModules dropped the subIdx entry for a module with an open document")
+	}
+	p.graph.mu.Lock()
+	_, stillSlotted := p.graph.subslots[modRoot]
+	p.graph.mu.Unlock()
+	if !stillSlotted {
+		t.Error("evictIdleModules dropped the graph subslot for a module with an open document")
+	}
+}
+
+// TestEvictIdleModules_KeepsModuleWithScopeUnit verifies a module with a live
+// scope unit (prefixed with its root-relative path, per prefixUnit/unitFor)
+// is not dropped.
+func TestEvictIdleModules_KeepsModuleWithScopeUnit(t *testing.T) {
+	p, _ := newTestProxy()
+	root := t.TempDir()
+	p.root = root
+	modRoot := filepath.Join(root, "wt", "nested")
+	p.scope["wt/nested/pkg"] = &scopeEntry{open: map[string]bool{}, lastActive: time.Now()}
+
+	p.subIdx = map[string]*revIndex{modRoot: newRevIndex(log.New(io.Discard, "", 0))}
+	p.graph = &graphServer{log: log.New(io.Discard, "", 0), subslots: map[string]*graphSlot{modRoot: {}}}
+
+	p.evictIdleModules()
+
+	p.subIdxMu.Lock()
+	_, stillIndexed := p.subIdx[modRoot]
+	p.subIdxMu.Unlock()
+	if !stillIndexed {
+		t.Error("evictIdleModules dropped the subIdx entry for a module with a live scope unit")
+	}
+	p.graph.mu.Lock()
+	_, stillSlotted := p.graph.subslots[modRoot]
+	p.graph.mu.Unlock()
+	if !stillSlotted {
+		t.Error("evictIdleModules dropped the graph subslot for a module with a live scope unit")
+	}
+}
+
+// TestEvictIdleModules_ReTouchRebuildsLazily proves eviction is not a
+// permanent break: re-touching an evicted module makes indexFor and the
+// graph subslot lookup lazily rebuild it, exactly as for a module never
+// before seen.
+func TestEvictIdleModules_ReTouchRebuildsLazily(t *testing.T) {
+	p, _ := newTestProxy()
+	root := t.TempDir()
+	p.root = root
+	p.idx = newRevIndex(log.New(io.Discard, "", 0))
+	p.modRoots = &moduleRootCache{}
+
+	modRoot := filepath.Join(root, "wt", "nested")
+	if err := os.MkdirAll(modRoot, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(modRoot, "go.mod"), []byte("module example.com/nested\n\ngo 1.26\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(modRoot, "x.go"), []byte("package x\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	p.graph = &graphServer{log: log.New(io.Discard, "", 0), root: root, modRoots: p.modRoots, indexFor: p.indexFor}
+
+	// First touch: builds the subIdx entry and the graph subslot.
+	first := p.indexFor(modRoot)
+	if !first.WaitReady(2 * time.Second) {
+		t.Fatal("sub-index did not become ready before eviction")
+	}
+	firstResp := p.graph.answer(driverQuery{Patterns: nestedModuleLoadPattern, Dir: modRoot, Request: json.RawMessage(`{}`)})
+	if bytes.Equal(firstResp, notHandled) {
+		t.Fatal("initial nested-module driver query returned NotHandled")
+	}
+
+	// Nothing has this module in scope and no document is open: eviction
+	// drops both.
+	p.evictIdleModules()
+	p.subIdxMu.Lock()
+	_, stillIndexed := p.subIdx[modRoot]
+	p.subIdxMu.Unlock()
+	if stillIndexed {
+		t.Fatal("evictIdleModules did not drop the subIdx entry")
+	}
+	p.graph.mu.Lock()
+	_, stillSlotted := p.graph.subslots[modRoot]
+	p.graph.mu.Unlock()
+	if stillSlotted {
+		t.Fatal("evictIdleModules did not drop the graph subslot")
+	}
+
+	// Re-touch: indexFor must lazily rebuild a working sub-index instance,
+	// not return the evicted one.
+	second := p.indexFor(modRoot)
+	if second == first {
+		t.Error("indexFor after eviction returned the evicted instance, want a freshly rebuilt one")
+	}
+	if !second.WaitReady(2 * time.Second) {
+		t.Fatal("re-touched sub-index did not become ready")
+	}
+
+	// Re-touch: the graph subslot must lazily rebuild and answer correctly,
+	// exactly as it did before eviction.
+	secondResp := p.graph.answer(driverQuery{Patterns: nestedModuleLoadPattern, Dir: modRoot, Request: json.RawMessage(`{}`)})
+	if bytes.Equal(secondResp, notHandled) {
+		t.Error("nested-module driver query after eviction returned NotHandled, want a lazily rebuilt response")
+	}
+}
