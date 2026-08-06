@@ -40,8 +40,17 @@ type graphServer struct {
 	cacheFile string // path to the on-disk graph file; empty if no root yet
 	ln        net.Listener
 
-	mu           sync.Mutex
-	root         string // workspace root, for the startup freshness check
+	mu   sync.Mutex
+	root string // workspace root, for the startup freshness check
+	main graphSlot
+}
+
+// graphSlot holds the mutable, per-workspace go/packages driver cache: the
+// cached DriverResponse, the pattern set it was built for, its build
+// directory, in-flight/staleness bookkeeping, and the //go:embed footprint
+// used to decide whether a non-Go file change can affect the graph.
+// Protected by the owning graphServer's mu.
+type graphSlot struct {
 	resp         []byte // cached marshaled DriverResponse
 	patternsKey  string
 	patterns     []string
@@ -256,14 +265,14 @@ func (g *graphServer) loadDiskCache() {
 		g.log.Printf("driver: disk cache retargeted from %s to %s", saved.Dir, dir)
 	}
 	g.mu.Lock()
-	g.resp = resp
-	g.patternsKey = saved.PatternsKey
-	g.patterns = saved.Patterns
-	g.dir = dir
-	g.stale = false
+	g.main.resp = resp
+	g.main.patternsKey = saved.PatternsKey
+	g.main.patterns = saved.Patterns
+	g.main.dir = dir
+	g.main.stale = false
 	g.mu.Unlock()
 	// Decode the embed footprint off the critical path: the first workspace
-	// query only needs g.resp, which is already published above.
+	// query only needs g.main.resp, which is already published above.
 	go g.setEmbedFromResp(resp)
 	g.log.Printf("driver: loaded disk cache (%d bytes) from %s", len(resp), g.cacheFile)
 
@@ -280,11 +289,11 @@ func (g *graphServer) loadDiskCache() {
 	patterns, key := saved.Patterns, saved.PatternsKey
 	time.AfterFunc(delay, func() {
 		g.mu.Lock()
-		if g.building {
+		if g.main.building {
 			g.mu.Unlock()
 			return // a MarkStale-triggered rebuild already covered it
 		}
-		g.building = true
+		g.main.building = true
 		g.mu.Unlock()
 		g.build(patterns, dir, key)
 	})
@@ -388,9 +397,9 @@ func (g *graphServer) storeEmbed(files, prefixSet map[string]bool) {
 		prefixes = append(prefixes, p)
 	}
 	g.mu.Lock()
-	g.embedFiles = files
-	g.embedPrefixes = prefixes
-	g.embedReady = true
+	g.main.embedFiles = files
+	g.main.embedPrefixes = prefixes
+	g.main.embedReady = true
 	g.mu.Unlock()
 }
 
@@ -424,13 +433,13 @@ func (g *graphServer) IsEmbedFile(path string) bool {
 	p := filepath.ToSlash(path)
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if !g.embedReady {
+	if !g.main.embedReady {
 		return true
 	}
-	if g.embedFiles[p] {
+	if g.main.embedFiles[p] {
 		return true
 	}
-	for _, root := range g.embedPrefixes {
+	for _, root := range g.main.embedPrefixes {
 		if p == root || strings.HasPrefix(p, root+"/") {
 			return true
 		}
@@ -491,21 +500,21 @@ func (g *graphServer) answer(q driverQuery) []byte {
 	key := strings.Join(q.Patterns, "\x00")
 
 	g.mu.Lock()
-	resp := g.resp
-	stale := g.stale
-	hasCache := resp != nil && key == g.patternsKey
+	resp := g.main.resp
+	stale := g.main.stale
+	hasCache := resp != nil && key == g.main.patternsKey
 
 	// A query from outside the cached dir targets another checkout; the cached
 	// absolute paths would be wrong there. Fall back to go list and rebuild for
 	// the queried dir so serving resumes from the right root.
-	if hasCache && !dirCompatible(q.Dir, g.dir) {
-		if isWorkspaceQuery(q.Patterns) && !g.building {
-			g.building = true
+	if hasCache && !dirCompatible(q.Dir, g.main.dir) {
+		if isWorkspaceQuery(q.Patterns) && !g.main.building {
+			g.main.building = true
 			patterns := append([]string(nil), q.Patterns...)
 			dir := q.Dir
 			go g.build(patterns, dir, key)
 		}
-		cached := g.dir
+		cached := g.main.dir
 		g.mu.Unlock()
 		g.log.Printf("driver: NotHandled (query dir %s does not match cached dir %s)", q.Dir, cached)
 		return notHandled
@@ -514,8 +523,8 @@ func (g *graphServer) answer(q driverQuery) []byte {
 	if !hasCache {
 		// No cache at all: trigger a background build for workspace queries
 		// and tell gopls to fall back to the real go list.
-		if isWorkspaceQuery(q.Patterns) && !g.building {
-			g.building = true
+		if isWorkspaceQuery(q.Patterns) && !g.main.building {
+			g.main.building = true
 			patterns := append([]string(nil), q.Patterns...)
 			dir := q.Dir
 			go g.build(patterns, dir, key)
@@ -528,9 +537,9 @@ func (g *graphServer) answer(q driverQuery) []byte {
 	// We have a cache. If it is stale (go.mod / imports changed on disk),
 	// kick off a background rebuild but still serve the cached data so
 	// re-scopes during the ~13s rebuild window don't regress to full go list.
-	if stale && !g.building {
-		g.building = true
-		patterns, dir := g.patterns, g.dir
+	if stale && !g.main.building {
+		g.main.building = true
+		patterns, dir := g.main.patterns, g.main.dir
 		go g.build(patterns, dir, key)
 	}
 	g.mu.Unlock()
@@ -589,7 +598,7 @@ func (g *graphServer) build(patterns []string, dir, key string) {
 	if err != nil {
 		g.log.Printf("driver: build failed: %v", err)
 		g.mu.Lock()
-		g.building = false
+		g.main.building = false
 		g.mu.Unlock()
 		return
 	}
@@ -613,17 +622,17 @@ func (g *graphServer) build(patterns []string, dir, key string) {
 	if err != nil {
 		g.log.Printf("driver: marshal failed: %v", err)
 		g.mu.Lock()
-		g.building = false
+		g.main.building = false
 		g.mu.Unlock()
 		return
 	}
 	g.mu.Lock()
-	g.resp = b
-	g.patterns = patterns
-	g.patternsKey = key
-	g.dir = dir
-	g.stale = false
-	g.building = false
+	g.main.resp = b
+	g.main.patterns = patterns
+	g.main.patternsKey = key
+	g.main.dir = dir
+	g.main.stale = false
+	g.main.building = false
 	g.mu.Unlock()
 	g.setEmbedFromPackages(all)
 	g.log.Printf("driver: graph built in %s (%d packages, %d roots, %dMB)",
@@ -650,24 +659,24 @@ func (g *graphServer) overlayDirty(overlay map[string][]byte) bool {
 func (g *graphServer) MarkStale(reason string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if g.patternsKey == "" {
+	if g.main.patternsKey == "" {
 		return // never built; nothing to refresh
 	}
-	if !g.stale {
+	if !g.main.stale {
 		g.log.Printf("driver: cache marked stale (%s)", reason)
 	}
-	g.stale = true
-	if g.rebuildTimer != nil {
-		g.rebuildTimer.Stop()
+	g.main.stale = true
+	if g.main.rebuildTimer != nil {
+		g.main.rebuildTimer.Stop()
 	}
-	g.rebuildTimer = time.AfterFunc(3*time.Second, func() {
+	g.main.rebuildTimer = time.AfterFunc(3*time.Second, func() {
 		g.mu.Lock()
-		if g.building {
+		if g.main.building {
 			g.mu.Unlock()
 			return
 		}
-		g.building = true
-		patterns, dir, key := g.patterns, g.dir, g.patternsKey
+		g.main.building = true
+		patterns, dir, key := g.main.patterns, g.main.dir, g.main.patternsKey
 		g.mu.Unlock()
 		g.build(patterns, dir, key)
 	})

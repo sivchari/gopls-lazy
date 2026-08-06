@@ -272,7 +272,7 @@ func TestGraphServer_LoadDiskCache_Retarget(t *testing.T) {
 	g.loadDiskCache()
 
 	g.mu.Lock()
-	resp, dir := string(g.resp), g.dir
+	resp, dir := string(g.main.resp), g.main.dir
 	g.mu.Unlock()
 	wantResp := `{"Packages":[{"GoFiles":["` + root + `/pkg/a.go"]}]}`
 	if resp != wantResp {
@@ -286,11 +286,13 @@ func TestGraphServer_LoadDiskCache_Retarget(t *testing.T) {
 func TestGraphServer_Answer_DirMismatch(t *testing.T) {
 	otherDir := t.TempDir()
 	g := &graphServer{
-		log:         log.New(io.Discard, "", 0),
-		resp:        []byte(`{"Packages":[{"GoFiles":["/repo/pkg/a.go"]}]}`),
-		patternsKey: "./...",
-		patterns:    []string{"./..."},
-		dir:         "/repo",
+		log: log.New(io.Discard, "", 0),
+		main: graphSlot{
+			resp:        []byte(`{"Packages":[{"GoFiles":["/repo/pkg/a.go"]}]}`),
+			patternsKey: "./...",
+			patterns:    []string{"./..."},
+			dir:         "/repo",
+		},
 	}
 
 	// A query from another checkout must not be served the cached paths.
@@ -299,7 +301,7 @@ func TestGraphServer_Answer_DirMismatch(t *testing.T) {
 		t.Errorf("answer(mismatched dir) = %s, want NotHandled", got)
 	}
 	g.mu.Lock()
-	building := g.building
+	building := g.main.building
 	g.mu.Unlock()
 	if !building {
 		t.Error("mismatched workspace query should trigger a rebuild for the new dir")
@@ -307,7 +309,7 @@ func TestGraphServer_Answer_DirMismatch(t *testing.T) {
 
 	// A query from the cached dir itself is still served.
 	g.mu.Lock()
-	g.building = false
+	g.main.building = false
 	g.mu.Unlock()
 	got = g.answer(driverQuery{Patterns: []string{"./..."}, Dir: "/repo", Request: json.RawMessage(`{}`)})
 	if bytes.Equal(got, notHandled) {
