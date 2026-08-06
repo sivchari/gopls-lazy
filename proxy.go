@@ -61,8 +61,9 @@ type proxy struct {
 	workerSF singleflight.Group // dedups concurrent identical isolated-worker requests
 	worker   *workerHandle      // persistent isolated gopls for whole-workspace queries
 
-	idx   *revIndex
-	graph *graphServer
+	idx      *revIndex
+	graph    *graphServer
+	modRoots *moduleRootCache // nested (e.g. worktree) go.mod detection for unitFor; nil is treated as "no nested modules"
 
 	toServer *frameWriter
 	toClient *frameWriter

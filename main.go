@@ -229,6 +229,7 @@ func Run() int {
 		pendingDiag: map[string]bool{},
 		pendingOwn:  map[string]chan *message{},
 		idx:         newRevIndex(logger),
+		modRoots:    &moduleRootCache{},
 		log:         logger,
 	}
 	p.worker = &workerHandle{p: p}
