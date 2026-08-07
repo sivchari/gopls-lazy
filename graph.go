@@ -65,6 +65,7 @@ type graphSlot struct {
 	resp         []byte // cached marshaled DriverResponse
 	patternsKey  string
 	patterns     []string
+	buildFlags   []string // packages.DriverRequest.BuildFlags the cached resp was built with; replayed by background rebuilds (markSlotStale) so they never silently drop it
 	dir          string
 	building     bool
 	stale        bool
@@ -82,6 +83,7 @@ type savedGraph struct {
 	Resp        []byte   `json:"resp"`
 	PatternsKey string   `json:"patternsKey"`
 	Patterns    []string `json:"patterns"`
+	BuildFlags  []string `json:"buildFlags,omitempty"` // the DriverRequest.BuildFlags the graph was built with; see graphSlot.buildFlags
 	Dir         string   `json:"dir"`
 	Root        string   `json:"root"` // workspace root the graph was built for
 }
@@ -142,6 +144,29 @@ type driverQuery struct {
 	Patterns []string
 	Dir      string
 	Request  json.RawMessage
+}
+
+// canonicalKey folds a driver query's patterns and BuildFlags into a single
+// cache-key string: BuildFlags (e.g. -tags=) changes what packages.Load
+// computes, so two requests differing only in BuildFlags must never share a
+// cached graph (see answerSlot's key == slot.patternsKey check). When
+// buildFlags is empty -- the vast majority of queries, since most users never
+// configure gopls's buildFlags setting -- the result is byte-identical to the
+// pre-BuildFlags format (patterns joined by NUL), so on-disk caches written
+// before this fix remain valid/hit-compatible after an upgrade.
+func canonicalKey(patterns, buildFlags []string) string {
+	return strings.Join(patterns, "\x00") + buildFlagsSuffix(buildFlags)
+}
+
+// buildFlagsSuffix returns the canonical suffix folding buildFlags into a
+// cache key, or "" when buildFlags is empty. The "\x00\x00flags\x00" marker
+// cannot be produced by strings.Join(patterns, "\x00") for any non-empty
+// pattern list, so it never collides with the patterns-only prefix.
+func buildFlagsSuffix(buildFlags []string) string {
+	if len(buildFlags) == 0 {
+		return ""
+	}
+	return "\x00\x00flags\x00" + strings.Join(buildFlags, "\x00")
 }
 
 // startGraphServer starts the GOPACKAGESDRIVER unix socket server.
@@ -281,6 +306,7 @@ func (g *graphServer) loadDiskCache() {
 	g.main.resp = resp
 	g.main.patternsKey = saved.PatternsKey
 	g.main.patterns = saved.Patterns
+	g.main.buildFlags = saved.BuildFlags
 	g.main.dir = dir
 	g.main.stale = false
 	g.mu.Unlock()
@@ -299,7 +325,7 @@ func (g *graphServer) loadDiskCache() {
 		delay = freshRevalidateDelay
 	}
 	g.log.Printf("driver: disk cache served; background revalidation in %s", delay)
-	patterns, key := saved.Patterns, saved.PatternsKey
+	patterns, key, buildFlags := saved.Patterns, saved.PatternsKey, saved.BuildFlags
 	time.AfterFunc(delay, func() {
 		g.mu.Lock()
 		if g.main.building {
@@ -308,7 +334,7 @@ func (g *graphServer) loadDiskCache() {
 		}
 		g.main.building = true
 		g.mu.Unlock()
-		g.build(patterns, dir, key)
+		g.build(patterns, dir, key, buildFlags)
 	})
 }
 
@@ -469,7 +495,7 @@ func (g *graphServer) IsEmbedFile(path string) bool {
 
 // saveDiskCache writes the current graph to the on-disk cache file.
 // Callers must NOT hold g.mu.
-func (g *graphServer) saveDiskCache(resp []byte, patternsKey string, patterns []string, dir string) {
+func (g *graphServer) saveDiskCache(resp []byte, patternsKey string, patterns []string, dir string, buildFlags []string) {
 	if g.cacheFile == "" {
 		return
 	}
@@ -480,6 +506,7 @@ func (g *graphServer) saveDiskCache(resp []byte, patternsKey string, patterns []
 		Resp:        resp,
 		PatternsKey: patternsKey,
 		Patterns:    patterns,
+		BuildFlags:  buildFlags,
 		Dir:         dir,
 		Root:        root,
 	}
@@ -527,7 +554,7 @@ func (g *graphServer) answer(q driverQuery) []byte {
 	if err := json.Unmarshal(q.Request, &req); err != nil {
 		return notHandled
 	}
-	key := strings.Join(q.Patterns, "\x00")
+	key := canonicalKey(q.Patterns, req.BuildFlags)
 
 	modRoot := g.resolveModRootForQuery(q)
 	if modRoot == "" {
@@ -660,7 +687,7 @@ func (g *graphServer) answerSlot(slot *graphSlot, idx *revIndex, q driverQuery, 
 			slot.building = true
 			patterns := append([]string(nil), q.Patterns...)
 			dir := q.Dir
-			go g.buildSlot(slot, patterns, dir, key, persist)
+			go g.buildSlot(slot, patterns, dir, key, req.BuildFlags, persist)
 		}
 		cached := slot.dir
 		g.mu.Unlock()
@@ -675,7 +702,7 @@ func (g *graphServer) answerSlot(slot *graphSlot, idx *revIndex, q driverQuery, 
 			slot.building = true
 			patterns := append([]string(nil), q.Patterns...)
 			dir := q.Dir
-			go g.buildSlot(slot, patterns, dir, key, persist)
+			go g.buildSlot(slot, patterns, dir, key, req.BuildFlags, persist)
 		}
 		g.mu.Unlock()
 		g.log.Printf("driver: NotHandled (no cache, patterns=%v)", q.Patterns)
@@ -685,10 +712,14 @@ func (g *graphServer) answerSlot(slot *graphSlot, idx *revIndex, q driverQuery, 
 	// We have a cache. If it is stale (go.mod / imports changed on disk),
 	// kick off a background rebuild but still serve the cached data so
 	// re-scopes during the ~13s rebuild window don't regress to full go list.
+	// Replayed from slot, not req: hasCache already guarantees key ==
+	// slot.patternsKey, so slot.buildFlags is the same BuildFlags this
+	// request's key encodes -- this refreshes the graph already being served,
+	// it does not answer a new/different query.
 	if stale && !slot.building {
 		slot.building = true
-		patterns, dir := slot.patterns, slot.dir
-		go g.buildSlot(slot, patterns, dir, key, persist)
+		patterns, dir, buildFlags := slot.patterns, slot.dir, slot.buildFlags
+		go g.buildSlot(slot, patterns, dir, key, buildFlags, persist)
 	}
 	g.mu.Unlock()
 
@@ -707,15 +738,23 @@ func (g *graphServer) answerSlot(slot *graphSlot, idx *revIndex, q driverQuery, 
 	return resp
 }
 
-// nestedModuleCacheKey is the fixed patternsKey every subslot build is
-// stored under, regardless of which literal pattern the query that triggered
-// it asked for. A subslot always answers with the WHOLE nested module's
-// package graph (built from the "all" pattern, see nestedModuleLoadPattern):
-// nested modules are small (a git worktree is a tiny slice of the
-// monorepo), so loading the whole thing once is cheap and lets every
-// subsequent query for that module — whatever its own pattern — hit the same
-// cache, instead of rebuilding per distinct pattern.
-const nestedModuleCacheKey = "nested:all"
+// nestedModuleCacheKeyBase is the fixed patternsKey base every subslot build
+// is stored under, regardless of which literal pattern the query that
+// triggered it asked for. A subslot always answers with the WHOLE nested
+// module's package graph (built from the "all" pattern, see
+// nestedModuleLoadPattern): nested modules are small (a git worktree is a
+// tiny slice of the monorepo), so loading the whole thing once is cheap and
+// lets every subsequent query for that module — whatever its own pattern —
+// hit the same cache, instead of rebuilding per distinct pattern.
+const nestedModuleCacheKeyBase = "nested:all"
+
+// nestedModuleCacheKey returns the patternsKey a subslot build for the given
+// BuildFlags is stored under: nestedModuleCacheKeyBase, plus the same
+// BuildFlags suffix canonicalKey uses, so two requests for the same nested
+// module differing only in BuildFlags never collide on the same cache entry.
+func nestedModuleCacheKey(buildFlags []string) string {
+	return nestedModuleCacheKeyBase + buildFlagsSuffix(buildFlags)
+}
 
 // nestedModuleLoadPattern is the pattern every subslot build uses, regardless
 // of the query pattern that triggered it — see nestedModuleCacheKey. "all"
@@ -735,16 +774,20 @@ var nestedModuleLoadPattern = []string{"all"}
 // synchronous build is the only way to answer such a query correctly;
 // acceptable because nested modules are small.
 func (g *graphServer) answerNestedSlot(slot *graphSlot, idx *revIndex, modRoot string, q driverQuery, req packages.DriverRequest) []byte {
+	wantKey := nestedModuleCacheKey(req.BuildFlags)
 	g.mu.Lock()
 	resp := slot.resp
 	stale := slot.stale
-	hasCache := resp != nil
+	hasCache := resp != nil && slot.patternsKey == wantKey
 	g.mu.Unlock()
 
 	if hasCache {
-		return g.answerNestedSlotFromCache(slot, idx, modRoot, q, req, resp, stale)
+		return g.answerNestedSlotFromCache(slot, idx, modRoot, q, req, wantKey, resp, stale)
 	}
 
+	// No cache, or a cache built under different BuildFlags: either way there
+	// is nothing valid to serve for this request, so fall through to the same
+	// synchronous build path.
 	g.mu.Lock()
 	building := slot.building
 	if !building {
@@ -756,7 +799,7 @@ func (g *graphServer) answerNestedSlot(slot *graphSlot, idx *revIndex, modRoot s
 		return notHandled
 	}
 
-	g.buildSlot(slot, nestedModuleLoadPattern, modRoot, nestedModuleCacheKey, false)
+	g.buildSlot(slot, nestedModuleLoadPattern, modRoot, wantKey, req.BuildFlags, false)
 
 	g.mu.Lock()
 	resp = slot.resp
@@ -769,11 +812,12 @@ func (g *graphServer) answerNestedSlot(slot *graphSlot, idx *revIndex, modRoot s
 }
 
 // answerNestedSlotFromCache answers a nested-module subslot query that
-// already has a cached graph: fresh cache is served as-is; a dirty overlay
-// falls back to NotHandled (the cached snapshot cannot reflect unsaved
-// import changes); a stale cache (go.mod / imports changed on disk) is still
-// served immediately, with a background rebuild kicked off at most once.
-func (g *graphServer) answerNestedSlotFromCache(slot *graphSlot, idx *revIndex, modRoot string, q driverQuery, req packages.DriverRequest, resp []byte, stale bool) []byte {
+// already has a cached graph matching the request's BuildFlags (key): fresh
+// cache is served as-is; a dirty overlay falls back to NotHandled (the cached
+// snapshot cannot reflect unsaved import changes); a stale cache (go.mod /
+// imports changed on disk) is still served immediately, with a background
+// rebuild kicked off at most once.
+func (g *graphServer) answerNestedSlotFromCache(slot *graphSlot, idx *revIndex, modRoot string, q driverQuery, req packages.DriverRequest, key string, resp []byte, stale bool) []byte {
 	if g.overlayDirty(idx, req.Overlay) {
 		g.log.Printf("driver: nested module %s overlay changes imports, falling back to go list", modRoot)
 		return notHandled
@@ -789,7 +833,7 @@ func (g *graphServer) answerNestedSlotFromCache(slot *graphSlot, idx *revIndex, 
 	}
 	g.mu.Unlock()
 	if !building {
-		go g.buildSlot(slot, nestedModuleLoadPattern, modRoot, nestedModuleCacheKey, false)
+		go g.buildSlot(slot, nestedModuleLoadPattern, modRoot, key, req.BuildFlags, false)
 	}
 	g.log.Printf("driver: served %d patterns from stale nested-module cache (module %s, rebuild in progress)", len(q.Patterns), modRoot)
 	return resp
@@ -823,23 +867,49 @@ func isWorkspaceQuery(patterns []string) bool {
 // result, persisting it to the on-disk cache. Thin wrapper kept for its
 // existing callers (loadDiskCache, MarkStale); see buildSlot for the
 // slot-parameterized logic subslots also use.
-func (g *graphServer) build(patterns []string, dir, key string) {
-	g.buildSlot(&g.main, patterns, dir, key, true)
+func (g *graphServer) build(patterns []string, dir, key string, buildFlags []string) {
+	g.buildSlot(&g.main, patterns, dir, key, buildFlags, true)
 }
 
 // buildSlot runs `go list` for patterns/dir and populates slot with the
 // result. persist controls whether the build is also written to the on-disk
 // cache (main slot only, see answerSlot).
-func (g *graphServer) buildSlot(slot *graphSlot, patterns []string, dir, key string, persist bool) {
+//
+// buildFlags is packages.DriverRequest.BuildFlags, forwarded verbatim: it is
+// exactly gopls's own "build.buildFlags" setting, a small user-configured
+// array, and safe to fold into the cache key (see canonicalKey).
+//
+// DriverRequest.Env is deliberately NOT forwarded here, unlike BuildFlags.
+// x/tools' own external-driver client (go/packages/external.go) sets
+// DriverRequest.Env = cfg.Env, i.e. gopls's *entire* process environment
+// (os.Environ() plus its "env" setting merged in), not a small delta of
+// user-configured overrides the way BuildFlags is. Two things follow:
+//   - Since the gopls-lazy proxy runs in the same editor session as gopls, its
+//     own os.Environ() below already carries the vast majority of what would
+//     matter (a shell/session-level GOOS, GOFLAGS, etc.); the only genuinely
+//     new information in req.Env is gopls-settings-only overrides, which
+//     cannot be distinguished from the rest of the blob at the protocol level.
+//   - Folding a full ambient environment into the cache key would defeat the
+//     on-disk cache for nearly everyone: unlike BuildFlags, raw environments
+//     routinely differ in irrelevant ways between separate process launches
+//     (TMPDIR embeds a PID on darwin, session/IDE-injected vars, SHLVL, ...),
+//     so on-disk caches would essentially never hit across editor restarts.
+//     Merging it without keying on it would be worse: silently serving a
+//     graph built under a stale environment.
+//
+// So Env is left unread here, same as today (not a regression) and same as
+// Mode/Tests are intentionally left out of scope for this fix.
+func (g *graphServer) buildSlot(slot *graphSlot, patterns []string, dir, key string, buildFlags []string, persist bool) {
 	start := time.Now()
 	cfg := &packages.Config{
 		Mode: packages.NeedName | packages.NeedFiles | packages.NeedCompiledGoFiles |
 			packages.NeedImports | packages.NeedDeps | packages.NeedModule |
 			packages.NeedTypesSizes | packages.NeedEmbedFiles | packages.NeedEmbedPatterns |
 			packages.NeedForTest,
-		Dir:   dir,
-		Tests: true,
-		Env:   append(os.Environ(), "GOPACKAGESDRIVER=off"),
+		Dir:        dir,
+		Tests:      true,
+		BuildFlags: buildFlags,
+		Env:        append(os.Environ(), "GOPACKAGESDRIVER=off"),
 	}
 	roots, err := packages.Load(cfg, patterns...)
 	if err != nil {
@@ -877,6 +947,7 @@ func (g *graphServer) buildSlot(slot *graphSlot, patterns []string, dir, key str
 	slot.resp = b
 	slot.patterns = patterns
 	slot.patternsKey = key
+	slot.buildFlags = buildFlags
 	slot.dir = dir
 	slot.stale = false
 	slot.building = false
@@ -885,7 +956,7 @@ func (g *graphServer) buildSlot(slot *graphSlot, patterns []string, dir, key str
 	g.log.Printf("driver: graph built in %s (%d packages, %d roots, %dMB)",
 		time.Since(start).Round(time.Millisecond), len(all), len(rootIDs), len(b)>>20)
 	if persist {
-		go g.saveDiskCache(b, key, patterns, dir)
+		go g.saveDiskCache(b, key, patterns, dir, buildFlags)
 	}
 }
 
@@ -955,9 +1026,9 @@ func (g *graphServer) markSlotStale(slot *graphSlot, reason string, persist bool
 			return
 		}
 		slot.building = true
-		patterns, dir, key := slot.patterns, slot.dir, slot.patternsKey
+		patterns, dir, key, buildFlags := slot.patterns, slot.dir, slot.patternsKey, slot.buildFlags
 		g.mu.Unlock()
-		g.buildSlot(slot, patterns, dir, key, persist)
+		g.buildSlot(slot, patterns, dir, key, buildFlags, persist)
 	})
 }
 

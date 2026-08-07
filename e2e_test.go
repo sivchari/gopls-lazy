@@ -160,6 +160,29 @@ func TestE2EOrphanWindowRequests(t *testing.T) {
 	})
 }
 
+// TestE2E_BuildFlags_TaggedFileGetsPackageMetadata reproduces the field
+// report: a user configured gopls's buildFlags ("-tags=e2e") and opened a
+// file gated behind that same tag, and got "no package metadata for file"
+// because the driver never forwarded BuildFlags to the underlying `go list`.
+// This pins that, once buildFlags is configured, hover on the tagged file
+// works against the real driver (default -driver=true).
+func TestE2E_BuildFlags_TaggedFileGetsPackageMetadata(t *testing.T) {
+	skipUnlessE2E(t)
+
+	root, taggedFile, taggedPos := writeBuildTagRepo(t)
+	c := startProxy(t, root)
+	c.initializeWithOptions(t, root, map[string]any{"buildFlags": []string{"-tags=e2e"}})
+	c.openFile(t, taggedFile)
+
+	resp := c.call(t, methodHover, positionParams(taggedFile, taggedPos, nil), e2eBudget(e2eDefinitionBudget))
+	if len(resp.Error) > 0 {
+		t.Fatalf("hover on build-tagged file errored (buildFlags not honored): %s", resp.Error)
+	}
+	if len(resp.Result) == 0 || string(resp.Result) == "null" {
+		t.Fatalf("hover on Tagged returned no content: %s", resp.Result)
+	}
+}
+
 // textDocumentParams builds the textDocument-only request params shared by
 // document-scoped methods (documentSymbol, foldingRange, inlayHint, ...).
 func textDocumentParams(path string) map[string]any {
