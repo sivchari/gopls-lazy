@@ -212,6 +212,31 @@ func Call() int {
 	return root, repo, nested
 }
 
+// writeBuildTagRepo writes a minimal module with one file gated behind a
+// non-default build tag, isolated from writeMonorepo so the buildFlags E2E
+// test never perturbs the shared monorepo fixture the other subtests key
+// off. Returns the tagged file's path and the 0-based position of its
+// exported function, for a hover query.
+func writeBuildTagRepo(t *testing.T) (root, taggedFile string, taggedPos lspPosition) {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("resolve temp dir: %v", err)
+	}
+	writeRepoFile(t, root, "go.mod", "module example.com/tagged\n\ngo 1.21\n")
+	writeRepoFile(t, root, "normal.go", "package tagged\n\nfunc Normal() int { return 1 }\n")
+	const taggedSrc = `//go:build e2e
+
+package tagged
+
+// Tagged is only compiled with -tags=e2e.
+func Tagged() int { return 2 }
+`
+	taggedFile = writeRepoFile(t, root, "tagged.go", taggedSrc)
+	taggedPos = mustPos(t, taggedSrc, "func Tagged", "Tagged")
+	return root, taggedFile, taggedPos
+}
+
 func writeRepoFile(t *testing.T, root, rel, content string) string {
 	t.Helper()
 	path := filepath.Join(root, filepath.FromSlash(rel))

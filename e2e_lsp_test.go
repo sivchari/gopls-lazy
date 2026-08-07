@@ -317,6 +317,16 @@ func (c *lspClient) notify(t *testing.T, method string, params any) {
 // through workspace/configuration) and window.workDoneProgress.
 func (c *lspClient) initialize(t *testing.T, root string) {
 	t.Helper()
+	c.initializeWithOptions(t, root, nil)
+}
+
+// initializeWithOptions is like initialize but also advertises opts (e.g.
+// {"buildFlags": [...]}) via initializationOptions -- the same flat,
+// top-level shape the proxy itself uses for directoryFilters (see
+// optionDirectoryFilters in scope.go), so gopls picks it up the same way it
+// would from a real editor's static gopls settings.
+func (c *lspClient) initializeWithOptions(t *testing.T, root string, opts map[string]any) {
+	t.Helper()
 	params := map[string]any{
 		"processId": os.Getpid(),
 		"rootUri":   pathToURI(root),
@@ -327,6 +337,9 @@ func (c *lspClient) initialize(t *testing.T, root string) {
 		"workspaceFolders": []map[string]any{
 			{"uri": pathToURI(root), "name": filepath.Base(root)},
 		},
+	}
+	if len(opts) > 0 {
+		params["initializationOptions"] = opts
 	}
 	resp := c.call(t, "initialize", params, e2eBudget(e2eDefinitionBudget))
 	if len(resp.Error) > 0 {

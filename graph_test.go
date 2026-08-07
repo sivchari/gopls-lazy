@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"testing"
 	"time"
+
+	"golang.org/x/tools/go/packages"
 )
 
 func TestGoMinor(t *testing.T) {
@@ -499,7 +501,7 @@ func TestGraphServer_BuildSlot_SubslotSkipsDiskCache(t *testing.T) {
 	g := &graphServer{log: log.New(io.Discard, "", 0), cacheFile: cacheFile}
 
 	slot := &graphSlot{}
-	g.buildSlot(slot, []string{"./..."}, dir, "./...", false)
+	g.buildSlot(slot, []string{"./..."}, dir, "./...", nil, false)
 
 	g.mu.Lock()
 	resp := slot.resp
@@ -576,5 +578,290 @@ func TestGraphServer_MarkStaleFor_NoExistingSubslotIsNoop(t *testing.T) {
 	}
 	if mainStale {
 		t.Error("MarkStaleFor(nested path, no existing subslot) incorrectly marked the main slot stale")
+	}
+}
+
+// writeBuildTagFixture writes a tiny module with one file gated behind a
+// non-default build tag alongside an always-built file in the same package,
+// so a `go list` with vs. without -tags=sometag differs in whether
+// tagged.go is part of the compiled package (see respHasCompiledFile).
+func writeBuildTagFixture(t *testing.T, dir string) {
+	t.Helper()
+	writeGoMod(t, dir)
+	mustWriteFile(t, filepath.Join(dir, "normal.go"), "package x\n\nfunc Normal() {}\n")
+	mustWriteFile(t, filepath.Join(dir, "tagged.go"), "//go:build sometag\n\npackage x\n\nfunc Tagged() {}\n")
+}
+
+// respHasCompiledFile reports whether "tagged.go" (writeBuildTagFixture's
+// gated file) appears in any package's CompiledGoFiles in a marshaled
+// DriverResponse. Package.GoFiles deliberately includes files excluded by
+// the current build tags (see its doc comment), so CompiledGoFiles is the
+// field that actually reflects build-tag filtering.
+func respHasCompiledFile(t *testing.T, resp []byte) bool {
+	t.Helper()
+	const name = "tagged.go"
+	var r struct {
+		Packages []struct {
+			CompiledGoFiles []string
+		}
+	}
+	if err := json.Unmarshal(resp, &r); err != nil {
+		t.Fatalf("unmarshal DriverResponse: %v", err)
+	}
+	for _, p := range r.Packages {
+		for _, f := range p.CompiledGoFiles {
+			if filepath.Base(f) == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func TestCanonicalKey(t *testing.T) {
+	patterns := []string{"./..."}
+
+	noFlags := canonicalKey(patterns, nil)
+	if want := "./..."; noFlags != want {
+		t.Errorf("canonicalKey(patterns, nil) = %q, want byte-identical to strings.Join(patterns, NUL) = %q", noFlags, want)
+	}
+
+	tagged := canonicalKey(patterns, []string{"-tags=sometag"})
+	if tagged == noFlags {
+		t.Error("canonicalKey with BuildFlags must differ from canonicalKey without BuildFlags")
+	}
+
+	other := canonicalKey(patterns, []string{"-tags=othertag"})
+	if other == tagged {
+		t.Error("canonicalKey with different BuildFlags must produce different keys")
+	}
+}
+
+func TestNestedModuleCacheKey(t *testing.T) {
+	noFlags := nestedModuleCacheKey(nil)
+	if noFlags != nestedModuleCacheKeyBase {
+		t.Errorf("nestedModuleCacheKey(nil) = %q, want %q", noFlags, nestedModuleCacheKeyBase)
+	}
+	tagged := nestedModuleCacheKey([]string{"-tags=sometag"})
+	if tagged == noFlags {
+		t.Error("nestedModuleCacheKey with BuildFlags must differ from the flags-less key")
+	}
+}
+
+// TestGraphServer_BuildSlot_HonorsBuildFlags is the core regression pin for
+// the field-reported bug: BuildFlags must actually reach `go list`.
+func TestGraphServer_BuildSlot_HonorsBuildFlags(t *testing.T) {
+	dir := t.TempDir()
+	writeBuildTagFixture(t, dir)
+
+	g := &graphServer{log: log.New(io.Discard, "", 0)}
+
+	noTags := &graphSlot{}
+	g.buildSlot(noTags, []string{"./..."}, dir, canonicalKey([]string{"./..."}, nil), nil, false)
+	g.mu.Lock()
+	respNoTags, keyNoTags := noTags.resp, noTags.patternsKey
+	g.mu.Unlock()
+	if respNoTags == nil {
+		t.Fatal("buildSlot without BuildFlags failed to produce a response")
+	}
+	if respHasCompiledFile(t, respNoTags) {
+		t.Error("response without -tags=sometag should not include the tagged file")
+	}
+
+	tagged := &graphSlot{}
+	flags := []string{"-tags=sometag"}
+	g.buildSlot(tagged, []string{"./..."}, dir, canonicalKey([]string{"./..."}, flags), flags, false)
+	g.mu.Lock()
+	respTagged, keyTagged, gotFlags := tagged.resp, tagged.patternsKey, tagged.buildFlags
+	g.mu.Unlock()
+	if respTagged == nil {
+		t.Fatal("buildSlot with BuildFlags failed to produce a response")
+	}
+	if !respHasCompiledFile(t, respTagged) {
+		t.Error("response with -tags=sometag should include the tagged file")
+	}
+	if keyNoTags == keyTagged {
+		t.Error("slots built with different BuildFlags must have different patternsKey")
+	}
+	if len(gotFlags) != 1 || gotFlags[0] != "-tags=sometag" {
+		t.Errorf("slot.buildFlags = %v, want %v", gotFlags, flags)
+	}
+}
+
+// TestGraphServer_Answer_RegressionPin_TagLessCacheNotServedForTaggedQuery is
+// the literal field-reported bug: a warm tag-less cache must never be served
+// for a subsequently-arriving request with BuildFlags, and a request with
+// BuildFlags must eventually be served the tagged graph once rebuilt.
+func TestGraphServer_Answer_RegressionPin_TagLessCacheNotServedForTaggedQuery(t *testing.T) {
+	dir := t.TempDir()
+	writeBuildTagFixture(t, dir)
+
+	g := &graphServer{log: log.New(io.Discard, "", 0), main: graphSlot{dir: dir}}
+
+	// Warm a tag-less cache, as if built from an earlier query.
+	g.buildSlot(&g.main, []string{"./..."}, dir, canonicalKey([]string{"./..."}, nil), nil, false)
+	g.mu.Lock()
+	tagLessResp := g.main.resp
+	g.mu.Unlock()
+	if respHasCompiledFile(t, tagLessResp) {
+		t.Fatal("test setup invalid: warm cache unexpectedly includes the tagged file")
+	}
+
+	req, err := json.Marshal(packages.DriverRequest{BuildFlags: []string{"-tags=sometag"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := g.answer(driverQuery{Patterns: []string{dir + "/..."}, Dir: dir, Request: req})
+	if bytes.Equal(got, tagLessResp) {
+		t.Fatal("answer(tagged query) served the tag-less cache -- the literal bug this test pins")
+	}
+
+	waitFor(t, 15*time.Second, "background rebuild for the tagged query", func() bool {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		return !g.main.building
+	})
+
+	got = g.answer(driverQuery{Patterns: []string{dir + "/..."}, Dir: dir, Request: req})
+	if !respHasCompiledFile(t, got) {
+		t.Error("answer(tagged query) after the triggered rebuild did not include the tagged file")
+	}
+}
+
+// TestGraphServer_LoadDiskCache_RestoresBuildFlags verifies the disk-cache
+// round trip: BuildFlags persisted to savedGraph are restored onto the slot,
+// and a matching-flags query hits the restored cache while a
+// different-flags query does not.
+func TestGraphServer_LoadDiskCache_RestoresBuildFlags(t *testing.T) {
+	root := t.TempDir()
+	cache := filepath.Join(t.TempDir(), "graph.json")
+	flags := []string{"-tags=sometag"}
+	patterns := []string{"./..."}
+	key := canonicalKey(patterns, flags)
+	saved := savedGraph{
+		Resp:        []byte(`{"Packages":[{"GoFiles":["` + root + `/tagged.go"]}]}`),
+		PatternsKey: key,
+		Patterns:    patterns,
+		BuildFlags:  flags,
+		Dir:         root,
+		Root:        root,
+	}
+	data, err := json.Marshal(saved)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cache, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	g := &graphServer{log: log.New(io.Discard, "", 0), cacheFile: cache, root: root}
+	g.loadDiskCache()
+
+	g.mu.Lock()
+	gotFlags, gotKey := g.main.buildFlags, g.main.patternsKey
+	g.mu.Unlock()
+	if len(gotFlags) != 1 || gotFlags[0] != "-tags=sometag" {
+		t.Errorf("g.main.buildFlags = %v, want %v", gotFlags, flags)
+	}
+	if gotKey != key {
+		t.Errorf("g.main.patternsKey = %q, want %q", gotKey, key)
+	}
+
+	sameReq, err := json.Marshal(packages.DriverRequest{BuildFlags: flags})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := g.answer(driverQuery{Patterns: patterns, Dir: root, Request: sameReq})
+	if bytes.Equal(got, notHandled) {
+		t.Error("answer(same BuildFlags) after disk-cache load = NotHandled, want the restored cache")
+	}
+
+	g.mu.Lock()
+	g.main.building = false // undo any rebuild the same-flags query above may have triggered
+	g.mu.Unlock()
+
+	diffReq, err := json.Marshal(packages.DriverRequest{BuildFlags: []string{"-tags=other"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = g.answer(driverQuery{Patterns: patterns, Dir: root, Request: diffReq})
+	if !bytes.Equal(got, notHandled) {
+		t.Error("answer(different BuildFlags) after disk-cache load should not hit the restored cache")
+	}
+}
+
+// TestGraphServer_MarkSlotStale_ReplaysBuildFlags verifies that a
+// markSlotStale-triggered background rebuild reuses the BuildFlags of the
+// graph it is refreshing, rather than silently dropping them.
+func TestGraphServer_MarkSlotStale_ReplaysBuildFlags(t *testing.T) {
+	dir := t.TempDir()
+	writeBuildTagFixture(t, dir)
+
+	g := &graphServer{log: log.New(io.Discard, "", 0)}
+	patterns := []string{"./..."}
+	flags := []string{"-tags=sometag"}
+	key := canonicalKey(patterns, flags)
+	g.buildSlot(&g.main, patterns, dir, key, flags, false)
+
+	g.mu.Lock()
+	initialResp := g.main.resp
+	g.mu.Unlock()
+	if !respHasCompiledFile(t, initialResp) {
+		t.Fatal("test setup invalid: initial build did not honor BuildFlags")
+	}
+	g.mu.Lock()
+	g.main.resp = nil // only pass below if markSlotStale actually rebuilt
+	g.mu.Unlock()
+
+	g.markSlotStale(&g.main, "test", false)
+
+	waitFor(t, 15*time.Second, "markSlotStale timer firing", func() bool {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		return g.main.building
+	})
+	waitFor(t, 15*time.Second, "markSlotStale rebuild finishing", func() bool {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		return !g.main.building
+	})
+
+	g.mu.Lock()
+	resp, gotFlags := g.main.resp, g.main.buildFlags
+	g.mu.Unlock()
+	if !respHasCompiledFile(t, resp) {
+		t.Error("markSlotStale rebuild dropped BuildFlags: tagged file missing from the rebuilt graph")
+	}
+	if len(gotFlags) != 1 || gotFlags[0] != "-tags=sometag" {
+		t.Errorf("g.main.buildFlags after rebuild = %v, want %v", gotFlags, flags)
+	}
+}
+
+// TestGraphServer_AnswerNestedSlot_DistinctBuildFlagsRebuild verifies that a
+// nested subslot never collides two requests differing only in BuildFlags on
+// the same cache entry: this is answerNestedSlot's synchronous-build path, so
+// both queries below are answered inline with no need to wait.
+func TestGraphServer_AnswerNestedSlot_DistinctBuildFlagsRebuild(t *testing.T) {
+	root := t.TempDir()
+	modDir := filepath.Join(root, "wt", "nested")
+	writeBuildTagFixture(t, modDir)
+
+	g := &graphServer{log: log.New(io.Discard, "", 0), root: root, modRoots: &moduleRootCache{}}
+
+	noFlagsReq, err := json.Marshal(packages.DriverRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := g.answer(driverQuery{Patterns: []string{modDir + "/..."}, Dir: modDir, Request: noFlagsReq})
+	if respHasCompiledFile(t, got) {
+		t.Fatal("nested subslot response without BuildFlags should not include the tagged file")
+	}
+
+	taggedReq, err := json.Marshal(packages.DriverRequest{BuildFlags: []string{"-tags=sometag"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got = g.answer(driverQuery{Patterns: []string{modDir + "/..."}, Dir: modDir, Request: taggedReq})
+	if !respHasCompiledFile(t, got) {
+		t.Error("nested subslot response with BuildFlags did not include the tagged file (stale flags-less cache served, or key collision)")
 	}
 }
