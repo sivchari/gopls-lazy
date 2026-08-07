@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.4.1](https://github.com/sivchari/gopls-lazy/compare/v0.4.0...v0.4.1) - 2026-08-07
+- fix: honor DriverRequest build flags in the graph driver by @sivchari in https://github.com/sivchari/gopls-lazy/pull/17
+
 ## [v0.4.0](https://github.com/sivchari/gopls-lazy/compare/v0.3.0...v0.4.0) - 2026-08-06
 - fix: make definition/references reliable with a persistent worker and config-generation barrier by @sivchari in https://github.com/sivchari/gopls-lazy/pull/12
 - fix: hold inlayHint and hover until the file's scope unit is applied by @sivchari in https://github.com/sivchari/gopls-lazy/pull/14
