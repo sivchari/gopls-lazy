@@ -1,5 +1,8 @@
 # Changelog
 
+## [v0.4.2](https://github.com/sivchari/gopls-lazy/compare/v0.4.1...v0.4.2) - 2026-11-09
+- ci: switch read-only checks from pull_request_target to pull_request by @sivchari in https://github.com/sivchari/gopls-lazy/pull/19
+
 ## [v0.4.1](https://github.com/sivchari/gopls-lazy/compare/v0.4.0...v0.4.1) - 2026-08-07
 - fix: honor DriverRequest build flags in the graph driver by @sivchari in https://github.com/sivchari/gopls-lazy/pull/17
 
